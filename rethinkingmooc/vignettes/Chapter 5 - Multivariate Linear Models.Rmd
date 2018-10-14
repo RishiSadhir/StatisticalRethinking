@@ -134,6 +134,78 @@ Above, we plot the residuals from using median age at marriage to predict marria
 
 ## Counterfactual plot
 
+In counterfactual plots, we hold all predictor variables to their mean value except for one in particular. We plot this one varying predictor against our outcome of interest. We can generate this for each predictor variable independently.
+
+```{r}
+# Prepare counterfactual data
+age_avg <- mean(d$MedianAgeMarriage.s)
+new_marriage_rate <- seq(from = -3, to = 3, length.out = 30)
+new_data <- data_frame(
+  Marriage.s = new_marriage_rate,
+  MedianAgeMarriage.s = age_avg)
+
+# Calculate mean divorce (mu) and percentile interval
+mu <- link(m5.3, data = new_data)
+mu_mean <- apply(mu, 2, mean)
+mu_pi <- apply(mu, 2, PI)
+
+# Simulate counterfactual divorce outcomes and percentie interval
+divrate_sim <- sim(m5.3, data = new_data, n = 1e4)
+divrate_pi <- apply(divrate_sim, 2, PI)
+
+# counterfactual plot
+data_frame(
+  new_marriage_rate,
+  mean_divorce_rate = mu_mean,
+  mean_divorce_rate_min = mu_pi[1,],
+  mean_divorce_rate_max = mu_pi[2,],
+  divorce_rate_min = divrate_pi[1,],
+  divorce_rate_max = divrate_pi[2,]) %>% 
+  
+  ggplot(aes(x=new_marriage_rate, y=mean_divorce_rate)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = mean_divorce_rate_min, ymax = mean_divorce_rate_max), alpha = I(1/5)) +
+    geom_ribbon(aes(ymin = divorce_rate_min, ymax = divorce_rate_max), alpha = I(1/5)) +
+    coord_cartesian(xlim=c(-2, 3), ylim=c(6, 13)) +
+    ylab("Divorce") + xlab("Marriage Rate") +
+    ggtitle("Counterfactual plot", "MedianAgeMarriage.s = 0") +
+    theme_empty() + geom_vline(xintercept = 0, linetype=2) +
+    annotate("text", -.25, 13, label="Slower") +
+    annotate("text", .3, 13, label="Faster")
+```
+
+## Posterior prediction plots
+
+This is just a plot of predicted vs actual.
+
+1. Did the model fit correctly?
+2. How does the model fail?
+
+```{r}
+# Run link on training data
+mu <- link(m5.3)
+
+# Summarize the samples
+mu.mean <- apply(mu, 2, mean)
+mu.PI <- apply(mu, 2, PI)
+
+# Simulate observations
+divorce.sim <- sim(m5.3, n=1e4)
+divorce.PI <- apply(divorce.sim, 2, PI)
+
+# Plot predicted against actual
+plot(mu.mean ~ d$Divorce, col=rangi2, ylim=range(mu.PI),
+     xlab="Observed divorce", ylab="Predicted divorce")
+abline(a=0, b=1, lty=2)
+for (i in 1:nrow(d)) {
+  lines(rep(d$Divorce[i], 2), c(mu.PI[1, i], mu.PI[2, i]), col = rangi2)
+}
+```
+
+
+
+
+
 
 
 
