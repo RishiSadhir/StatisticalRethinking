@@ -1,0 +1,405 @@
+---
+title: "Chapter 3 - Sampling the imaginary"
+output: html_notebook
+---
+
+# Notes
+```{r include=FALSE}
+library(tidyverse)
+```
+
+## Posterior Distribution
+
+Lets begin by returning to our globe example. We are interested in estimating the proportion of the globe that is water given the data we have seen.
+```{r}
+# Initialize a set of candidate values our parameter could take
+p_grid <- seq(from=0, to=1, length.out=1000)
+
+# We initially believe every parameter has an equal probability of appearing
+prior <- rep(1, 1000)
+
+# We've seen 6 Waters from 9 tosses.
+# Whats the likelihood of this happening for every candidate parameter?
+likelihood <- dbinom(6, size=9, prob=p_grid)
+
+# Combine our prior knowledge with the likelihood provided by the evidence.
+posterior <- likelihood * prior
+
+# Normalize this in to a probability
+posterior <- posterior / sum(posterior)
+
+# Every candidate parameter now has an associated posterior probability
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+candidates
+```
+
+We can sample from the posterior distribution to understand the
+```{r}
+# Bootstrap the list of candidates weighted by their posterior
+size <- nrow(candidates)
+samples <- sample(seq_len(size), prob=posterior, size=1e4, replace=TRUE)
+
+candidates[samples, ] %>% 
+  ggplot(aes(p_grid)) +
+    geom_density(fill="darkgrey")
+```
+
+
+## Sampling from the posterior distribution.
+
+### Intervals of defined boundaries
+
+We could ask the question "What is the posterior probability that th eproportion of water is less than .5?":
+```{r}
+samples <- sample(seq_len(nrow(candidates)), prob=candidates$posterior, size = 1e4, replace = TRUE)
+
+candidates[samples, ] %>% 
+  filter(p_grid < .5) %>% 
+  nrow(.)/1e4
+```
+
+We could also ask "how much posterior probability lies between .5 and .75?":
+```{r}
+samples <- sample(seq_len(nrow(candidates)), prob=candidates$posterior, size = 1e4, replace = TRUE)
+
+candidates[samples, ] %>% 
+  filter(p_grid > .5 & p_grid < .75) %>% 
+  nrow(.)/1e4
+```
+
+### Intervals of defined mass
+
+We can define a credible interval from the posterior like so:
+```{r}
+samples <- sample(seq_len(nrow(candidates)), prob=candidates$posterior, size = 1e4, replace = TRUE)
+
+quantile(candidates[samples, ]$p_grid, c(.1, .9))
+```
+
+This doesn't work if the distribution is skewed as it may not contain the parameters most likely value if, for example, the distribution looked like this:
+```{r}
+df = data_frame(p_grid=1:100, posterior=(1:100)^2)
+samples <- sample(seq_len(nrow(df)), prob=df$posterior, size = 1e4, replace = TRUE)
+pi <- quantile(df[samples, ]$p_grid, c(.25, .75))
+
+df[samples, ] %>% 
+  ggplot(aes(p_grid, posterior)) +
+  geom_line() +
+  geom_vline(xintercept = pi[[1]]) +
+  geom_vline(xintercept = pi[[2]])
+```
+
+The "correct" way to do this is to use the `highest posterior density interval (HPDI)` which calculates the narrowest interval containing the specified probability mass.
+```{r}
+df = data_frame(p_grid=1:100, posterior=(1:100)^2)
+samples <- sample(seq_len(nrow(df)), prob=df$posterior, size = 1e4, replace = TRUE)
+hdpi <- rethinking::HPDI(df[samples, ]$p_grid, prob = .5)
+
+df[samples, ] %>% 
+  ggplot(aes(p_grid, posterior)) +
+  geom_line() +
+  geom_vline(xintercept = hdpi[[1]]) +
+  geom_vline(xintercept = hdpi[[2]])
+```
+
+If the distribution isn't skewed, using `quantile` is usually good enough. Calculating the HDPI can be costly.
+
+### Point estimates
+
+If one must come up with a point estimate that summarizes the entire posterior distribution, the mode is likely the best choice.
+
+```{r}
+candidates %>% 
+  sample_frac(replace = TRUE, weight = posterior) %>% 
+  slice(which.max(.$posterior))
+```
+
+A more principled way to approach this problem is to define a `loss function`; A rule that tells you the cost associated with using any particular point estimate.
+
+## Sampling to simulate prediction
+
+A model's posterior can also be used to generate simulations for the purposes of 
+1. Model checking: Gut check the model's behavior
+2. Software validation: Simulate observations under a known model and attempt to recover the values of the parameters the data were simulated under.
+3. Research design: Power analysis
+4. Forecasting: Simulate new predictions
+
+### Dummy data
+
+Lets suppose we believe the true value of our parameter, the proportion of water on earth, is .7. If we toss the globe 2 times, our data can contain one of {0, 1, 2} possible waters. We can compute the likelihood of each possible datum using the binomial distribution:
+
+```{r}
+data_frame(parameter = 0:2, likelihood = dbinom(0:2, size = 2, prob = .7))
+```
+
+We can sample from these likelihoods to generate data along the lines of the empirical data using the `rbinom` function. Below, we generate 1000 simulations of 2 draws and plot the amount of simulations that contained 0, 1, and 2 waters respectively.
+
+```{r}
+rbinom(1000, size = 2, prob = .7) %>% 
+  as.factor %>% 
+  qplot
+```
+
+Here is the globe tossing example again with 9 samples and a probability of .7 instead:
+
+```{r}
+rbinom(1e5, size=9, prob=.7) %>% 
+  as.factor %>% 
+  qplot
+```
+
+### Model checking
+
+We can use the simulated dummy data to ask the question, "How well does the model reproduce the data used to educate it?". This should give us a good feel on whether or not the software that produced the model did so correctly. Our next step is to assess exactly how the model fails to describe the data as a path towards model comprehension, revision, and improvement.
+
+As shown above, each possible value of our parameter `p` has an implied distribution for its simulated data. The posterior distribution describes a distribution of the likelihood of these parameter values. We can sample from the posterior distribution to get values of `p` and then use that `p` to generate a distribution of predictions. Averaging over all these distributions of predictions gives us our `posterior predictive distribution`.
+
+```{r}
+# Posterior distribution of parameter values
+posterior_samples <- candidates %>% 
+  sample_frac(replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+# Distribution of predictions according to the distribution of parameter values
+rbinom(1e4, 9, posterior_samples) %>% 
+  as.factor %>% 
+  qplot
+```
+
+This distribution incorporates the uncertainty around the actual parameter value by incorporating the posterior distribution, instead of just using the most likely value of the parameter. It is therefore more honest.
+
+# Homework
+
+## Easy
+
+```{r}
+p_grid <- seq(from=0, to=1, length.out=1000)
+prior <- rep(1, 1000)
+likelihood <- dbinom(6, size=9, prob=p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+set.seed(100)
+samples <- sample(p_grid, prob = posterior, size = 1e4, replace = TRUE)
+qplot(samples)
+```
+
+How much posterior probability lies below $p=.2$?
+```{r}
+sum(samples < .2) / length(samples)
+```
+
+How much posterior probability lies above $p=.08$?
+```{r}
+sum(samples > .8) / length(samples)
+```
+
+How much posterior probability lies between $p=.2$ and $p = .8$?
+```{r}
+sum(samples < .8 & samples > .2) / length(samples)
+```
+
+20 percent of posterior probability lies below which value of `p`?
+```{r}
+p <- quantile(samples, .2)
+
+qplot(samples) + geom_vline(xintercept = p)
+```
+
+20 percent of posterior probability lies above which value of `p`?
+```{r}
+p <- quantile(samples, .8)
+qplot(samples) + 
+  geom_vline(xintercept = p)
+```
+
+Which values of p contain the narrowest interval equal to 66% of the posterior probability?
+```{r}
+hdpi <- rethinking::HPDI(samples, .66)
+qplot(samples) + 
+  geom_vline(xintercept = hdpi[[1]]) +
+  geom_vline(xintercept = hdpi[[2]])
+```
+
+Which values of p contain 66% of the posterior porbability assuming equal posterior probability both below and above the interval?
+```{r}
+pi <- quantile(samples, c(.17, .83))
+qplot(samples) + 
+  geom_vline(xintercept = pi[[1]]) +
+  geom_vline(xintercept = pi[[2]])
+```
+
+## Medium
+Suppose the globe tossing data had turned out to be 8 water in 15 tosses. Construct the posterior distribution, using grid approximation. Use the same flat prior as before.
+```{r}
+p_grid <- seq(from = 0, to = 1, length.out = 1e4)
+prior <- rep(1, 1e4)
+likelihood <- dbinom(8, size=15, p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+candidates
+```
+
+Draw 10000 samples from the grid approximation and use it to calculate the 90% HDPI for p
+```{r}
+samples <- candidates %>% 
+  sample_frac(replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+hdpi <- rethinking::HPDI(samples, prob = .9)
+qplot(samples) + geom_vline(xintercept = hdpi[[1]]) + geom_vline(xintercept = hdpi[[2]])
+```
+
+
+Construct a posterior predictive check for this model and data.
+```{r}
+posterior_predictive_distribution <- rbinom(1e4, 15, prob=samples)
+posterior_predictive_distribution %>% 
+  as.factor %>% 
+  qplot
+```
+
+What is th eprobability of observing 8 water in 15 tosses?
+```{r}
+sum(posterior_predictive_distribution == 8) / length(posterior_predictive_distribution)
+```
+
+What about 6 water in 9 tosses
+```{r}
+sum(posterior_predictive_distribution == 6) / length(posterior_predictive_distribution)
+```
+
+Now lets consider a prior that is zero below p = .5 and a constant above p = .5.
+```{r}
+p_grid <- seq(from = 0, to = 1, length.out = 1e4)
+prior <- ifelse(p_grid < .5, 0, 1)
+likelihood <- dbinom(8, size=15, p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+candidates
+```
+
+What is the probability of observing 8 water in 15 tosses with the new prior?
+```{r}
+samples <- candidates %>% 
+  sample_frac(replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+qplot(samples)
+```
+
+
+```{r}
+posterior_predictive_distribution <- rbinom(1e4, 15, prob = samples)
+posterior_predictive_distribution %>% 
+  as.factor %>% 
+  qplot() + ggtitle("Posterior predictive distribution")
+```
+
+```{r}
+sum(posterior_predictive_distribution == 8) / length(posterior_predictive_distribution)
+```
+
+## Hard
+These data indicate the gender (`male = 1` and `female = 0`) of first and second born children in 100 two-children families.
+```{r}
+birth1 <- c(1,0,0,0,1,1,0,1,0,1,0,0,1,1,0,1,1,0,0,0,1,0,0,0,1,0,
+            0,0,0,1,1,1,0,1,0,1,1,1,0,1,0,1,1,0,1,0,0,1,1,0,1,0,0,0,0,0,0,0,
+            1,1,0,1,0,0,1,0,0,0,1,0,0,1,1,1,1,0,1,0,1,1,1,1,1,0,0,1,0,1,1,0,
+            1,0,1,1,1,0,1,1,1,1)
+birth2 <- c(0,1,0,1,0,1,1,1,0,0,1,1,1,1,1,0,0,1,1,1,0,0,1,1,1,0,
+            1,1,1,0,1,1,1,0,1,0,0,1,1,1,1,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,
+            1,1,1,0,1,1,0,1,1,0,1,1,1,0,0,0,0,0,0,1,0,0,0,1,1,0,0,1,0,0,1,1,
+            0,0,0,1,1,1,0,0,0,0)
+
+glue::glue("Number of boys: {sum(birth1) + sum(birth2)}")
+```
+
+Using grid approximation, compute the posterior distribution for the probability of a birth being a boy.
+```{r}
+p_grid <- seq(from = 0, to = 1, length.out = 1000)
+prior <- rep(1, length(p_grid))
+n_boys <- sum(birth1) + sum(birth2)
+n_births <- length(birth1) + length(birth2)
+likelihood <- dbinom(n_boys, n_births, prob = p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+candidates
+```
+
+```{r}
+samples <- candidates %>% 
+  sample_n(1e4, replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+hpdis <- c(.5, .89, .97) 
+hpdis %>% 
+  map(~ rethinking::HPDI(samples, .x))
+```
+
+Use rbinom to simulate 10,000 replicates of 200 births. Compare the distribution of predicted numbers of boys to the actual count in the data (111 boys out of 200 births). 
+```{r}
+posterior_predictive_distribution <- rbinom(1e4, 200, samples)
+posterior_predictive_distribution %>% qplot
+```
+
+compare 10,000 counts of boys from 100 simulated first borns only to the number of boys in the first births, birth1. How does the model look in this light?
+```{r}
+p_grid <- seq(from = 0, to = 1, length.out = 1000)
+prior <- rep(1, length(p_grid))
+n_boys <- sum(birth1)
+n_births <- length(birth1)
+likelihood <- dbinom(n_boys, n_births, prob = p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+
+samples <- candidates %>% 
+  sample_n(1e4, replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+posterior_predictive_distribution <- rbinom(1e4, 100, samples)
+posterior_predictive_distribution %>% qplot
+
+```
+
+
+```{r}
+p_grid <- seq(from = 0, to = 1, length.out = 1000)
+prior <- rep(1, length(p_grid))
+n_boys <- sum(birth1)
+n_births <- length(birth1)
+likelihood <- dbinom(n_boys, n_births, prob = p_grid)
+posterior <- likelihood * prior
+posterior <- posterior / sum(posterior)
+
+candidates <- data_frame(p_grid, prior, likelihood, posterior)
+
+samples <- candidates %>% 
+  sample_n(1e4, replace = TRUE, weight = posterior) %>% 
+  pull(p_grid)
+
+posterior_predictive_distribution <- rbinom(1e4, 100, samples)
+posterior_predictive_distribution %>% qplot
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
