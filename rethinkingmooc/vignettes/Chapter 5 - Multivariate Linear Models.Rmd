@@ -323,25 +323,337 @@ ggplot(post, aes(bl, br)) +
   ggtitle("Posterior sample", "These two predictors are highly correlated")
 ```
 
-In summary, including two predictor variables that are strongly correlated in your model can lead to confusion. If all you're interested in is prediction though, you have nothing to worry about.
+In summary, including two predictor variables that are strongly correlated in your model can lead to confusion. If all you're interested in is prediction though, you have nothing to worry about. 
 
 ## Post treatment bias
-
+Post treatment bias occurs when you include variables that are consequences of other variables. It has essentially the same effect as multicollinearity in that you'll be able to say less about the original variable if you know about the consequenced variable already.
 
 # Categorical variables
+Categorical variables need to be encoded properly for good interpretation. For example, if your regression specification looks like this: $height_i = \beta_0 + \beta_1 isMale$ you can interpret $\beta_0$ as the average height of a female. Therefore, $\beta_1$ is the average difference in heights between males and females. Its also important to note that these two paramters are correlated, so you should take care to examine their intervals by relying on the posterior.
 
-# Ordinary least squares and lm
+To include k categories in a linear model, you require k − 1 dummy variables. Each dummy variable indicates, with the value 1, a unique category. The category with no dummy variable assigned to it ends up again as the “intercept” category. Alternatively, you can create "intercept" terms for every single possible category value.
+```{r eval=FALSE}
+data(milk)
+d <- milk
+
+# Construct an index variable (picklist)
+d$clade_id <- coerce_index(d$clade)
+
+m5.16_alt <- rethinking::map(
+  alist(
+    kcal.per.g ~ dnorm( mu , sigma ) ,
+    mu <- a[clade_id] ,
+    a[clade_id] ~ dnorm( 0.6 , 10 ) ,
+    sigma ~ dunif( 0 , 10 )
+), data=d)
+precis( m5.16_alt , depth=2 )
+```
 
 
+# Summary
+This chapter introduced multiple regression, a way of constructing descriptive models for how the mean of a measurement is associated with more than one predictor variable. The defining question of multiple regression is: What is the value of knowing each predictor, once we already know the other predictors? Implicit in this question are: 
+
+1. A focus on the value of the predictors for description of the sample, instead of forecasting a future sample
+2. The assumption that the value of each predictor does not depend upon the values of the other predictors. In the next two chapters, we confront these two issues.
 
 
+# Homework
+
+## Medium
+
+### 5M2
+Invent yourown example of a masked relationship. An outcome variable should be correlated with both predictor variables, but in opposite directions. And the two predictor variables should be correlated with one another.
+
+```{r}
+N <- 1e4
+
+data_frame(
+  x1 = rnorm(N),
+  x2 = rnorm(N, x1 + rnorm(N)),
+  outcome = x2 - x1 + rnorm(N)) ->
+df
+
+ggpairs(df)
+```
 
 
+### 5M4
+In the divorce data, States with high numbers of Mormons (members of The Church of Jesus ChristofLatter-daySaints, LDS) have much lower divorce rates than the regression models expected. Find a list of LDS population by State and use those numbers as a predictor variable, predicting divorce rate using marriage rate, median age at marriage, and percent LDS population (possibly standardized). You may want to consider transformations of the raw percent LDS variable.
+
+First lets get LDS percentages by scraping the web and joining it back to our data frame
+```{r}
+library(rvest)
+
+data(WaffleDivorce)
+
+# Scrape internet
+read_html("https://www.worldatlas.com/articles/mormon-population-by-state.html") %>%
+  html_nodes(xpath='//*[@id="artReg-table"]/table') %>%
+  html_table(trim=TRUE) %>%
+  bind_rows %>% as_tibble %>%
+  
+  # Clean columnames
+  magrittr::set_colnames(c("Rank", "State", "Mormon_Population", "Total_Population", "Percentage_Mormon")) %>% 
+  
+  # Join data sets
+  inner_join(as_data_frame(WaffleDivorce), by=c("State" = "Location")) %>% 
+  
+  # Center and scale predictors
+  transmute(
+    Location = State,
+    Percentage_Mormon = scale(as.numeric(str_remove(Percentage_Mormon, "%"))),
+    Median_Age = scale(MedianAgeMarriage),
+    Marriage_Rate = scale(Marriage),
+    Divorce_Rate = Divorce) ->
+df_lds
+
+df_lds
+```
+
+```{r}
+# Bootstrap the dataset 1000 times
+rsample::bootstraps(df_lds, times = 1e4) %>% 
+  pull(splits) %>% 
+  
+  # Run regression on each sample
+  map(~ lm(Divorce_Rate ~ Marriage_Rate + Median_Age + Percentage_Mormon, data = .x)$coefficients) %>% 
+  
+  # Pull out coefficients
+  reduce(bind_rows) %>% 
+  gather("Parameter", "Value") %>% 
+  group_by(Parameter) %>%
+  # Summarize the bootstrapped sample
+  mutate(
+    ymin = quantile(Value, .05),
+    ymax = quantile(Value, .95),
+    Value = quantile(Value, .5)) %>% 
+  unique %>% 
+  
+  # Plot coefficients
+  ggplot(aes(Parameter, Value)) +
+  geom_errorbar(aes(ymin=ymin, ymax=ymax)) +
+  geom_hline(yintercept=0) +
+  coord_flip() + theme_empty() +
+  ggtitle("Coefficient Measurments", "Knowing a states Mormon percentage makes it's marriage rate unimportant.")
+```
+
+## Hard
+```{r}
+data(foxes)
+df_foxes <- as_data_frame(foxes)
+df_foxes
+```
+
+### 5H1
+```Fit two bivariate Gaussian regressions, using map. Plot the results of these regressions, displaying the MAP regression line and the 95% interval of the mean. Is either variable important for predicting fox body weight?```
+
+```(1) body weight as a linear function of territory size (area)```
+```{r}
+# Fit model
+m5.5h1.1 <- rethinking::map(
+  alist(
+    weight ~ dnorm( mu , sigma ),
+    mu <- Intercept +
+        b_area*area,
+    Intercept ~ dnorm(0,10),
+    b_area ~ dnorm(0,10),
+    sigma ~ dunif(0, 10)
+), data = as.data.frame(df_foxes))
+
+# Counterfactual x-axis
+area_axis = seq(from=1, to=6, length.out=100)
+# Sample from the posterior
+posterior_samples <- extract.samples(m5.5h1.1)
+# Generate link function
+mu_link <- function(area) {
+  posterior_samples$Intercept + (posterior_samples$b_area * area)
+}
+# Generate predictions for each sample
+mu <- map(area_axis, mu_link)
+
+data_frame(
+  area = area_axis,
+  mu_mean = map_dbl(mu, mean),
+  mu_lower = map_dbl(mu, ~HPDI(.x, .95)[1]),
+  mu_upper = map_dbl(mu, ~HPDI(.x, .95)[2])
+) %>% 
+  ggplot(aes(area, mu_mean)) + 
+  geom_line() +
+  geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), alpha = I(1/4)) +
+  xlab("Area") + ylab("Weight") + theme_empty() +
+  coord_cartesian(ylim = c(2, 7))
+```
+
+```(2) body weight as a linear function of groupsize. ```
+```{r}
+# Fit model
+m5.5h1.2 <- rethinking::map(
+  alist(
+    weight ~ dnorm( mu , sigma ),
+    mu <- Intercept +
+        b_groupsize*groupsize,
+    Intercept ~ dnorm(0,10),
+    b_groupsize ~ dnorm(0,10),
+    sigma ~ dunif(0, 10)
+), data = as.data.frame(df_foxes))
+
+# Counterfactual x-axis
+groupsize_axis = seq(from=2, to=8, length.out=100)
+# Sample from the posterior
+posterior_samples <- extract.samples(m5.5h1.2)
+# Generate link function
+mu_link <- function(groupsize) {
+  posterior_samples$Intercept + (posterior_samples$b_groupsize * groupsize)
+}
+# Generate predictions for each sample
+mu <- map(groupsize_axis, mu_link)
+
+data_frame(
+  groupsize = groupsize_axis,
+  # Summarize the set of predictions 
+  # for each sample in the posterior
+  mu_mean = map_dbl(mu, mean),
+  mu_lower = map_dbl(mu, ~HPDI(.x, .95)[1]),
+  mu_upper = map_dbl(mu, ~HPDI(.x, .95)[2])
+) %>% 
+  ggplot(aes(groupsize, mu_mean)) + 
+  geom_line() +
+  geom_ribbon(aes(ymin = mu_lower, ymax = mu_upper), alpha = I(1/4)) +
+  xlab("Group Size") + ylab("Weight") + theme_empty()
+```
+
+Neither variable appears to be very important.
+
+### 5H2
+```Now fit a multiple linear regression with weight as the outcome and both area and groupsize as predictor variables.```
+
+```{r}
+rethinking::map(
+  alist(
+    weight ~ dnorm( mu , sigma ),
+    mu <- Intercept +
+        b_groupsize*groupsize +
+        b_area*area,
+    Intercept ~ dnorm(0,10),
+    b_groupsize ~ dnorm(0,10),
+    b_area ~ dnorm(0,10),
+    sigma ~ dunif(0, 10)
+    ), data = as.data.frame(df_foxes)
+) -> m5.5h2
+
+plot(precis(m5.5h2))
+```
+
+```Plot the predictions of the model for each predictor, holding the other predictor constant at its mean.```
+
+First we interrogate the posterior.
+```{r}
+posterior_samples <- extract.samples(m5.5h2)
+
+mu_link <- function(groupsize, area) {
+  posterior_samples$Intercept +
+    (posterior_samples$b_groupsize * groupsize) + 
+    (posterior_samples$b_area * area)
+}
+
+groupsize_axis <- seq(from = 2, to = 8, length.out = 100)
+area_mean <- mean(df_foxes$area)
+mu_groupsize <- purrr::map(groupsize_axis,
+                           ~ mu_link(.x, area_mean))
+
+area_axis <- seq(from = 1, to = 6, length.out = 100)
+groupsize_mean = mean(df_foxes$groupsize)
+mu_area <- purrr::map(area_axis,
+                      ~ mu_link(groupsize_mean, .x))
+```
+
+Counterfactual plot for groupsize
+```{r}
+data_frame(
+  groupsize = groupsize_axis,
+  weight = map_dbl(mu_groupsize, mean),
+  weight_lower = map_dbl(mu_groupsize, ~HPDI(.x, .95)[1]),
+  weight_upper = map_dbl(mu_groupsize, ~HPDI(.x, .95)[2])) %>% 
+  ggplot(aes(groupsize, weight)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = weight_lower, ymax = weight_upper), alpha = I(1/5)) +
+    ggtitle("Counterfactual plot", glue::glue("Area = {round(area_mean, 2)}")) +
+    theme_empty()
+```
+
+Counterfactual plot for area
+```{r}
+data_frame(
+  area = area_axis,
+  weight = map_dbl(mu_area, mean),
+  weight_lower = map_dbl(mu_area, ~HPDI(.x, .95)[1]),
+  weight_upper = map_dbl(mu_area, ~HPDI(.x, .95)[2])) %>% 
+  ggplot(aes(area, weight)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = weight_lower, ymax = weight_upper), alpha = I(1/5)) +
+    ggtitle("Counterfactual plot", glue::glue("Group size = {round(groupsize_mean, 2)}")) +
+    theme_empty()
+```
+
+```What does this model say about the importance of each variable? Why do you get different results than you got in the exercise just above?```
+
+This is a masking relationship.
+
+### 5H3. 
+`Finally, consider the avgfood variable. Fit two more multiple regressions: 
+
+(1) body weight as an additive function of avgfood and groupsize`
+```{r}
+m5.mh3.1 <- rethinking::map(
+  alist(
+    weight ~ dnorm( mu , sigma ),
+    mu <- Intercept +
+        b_avgfood*avgfood +
+        b_groupsize*groupsize,
+    Intercept ~ dnorm(0,10),
+    b_avgfood ~ dnorm(0,10),
+    b_groupsize ~ dnorm(0,10),
+    sigma ~ dunif(0,10)
+    ), data = as.data.frame(df_foxes)
+  )
+
+plot(precis(m5.mh3.1))
+```
 
 
+`(2) body weight as an additive function of all three variables, avgfood and groupsize and area.`
+```{r}
+m5.mh3.2 <- rethinking::map(
+  alist(
+    weight ~ dnorm( mu , sigma ),
+    mu <- Intercept +
+        b_avgfood*avgfood +
+        b_groupsize*groupsize +
+        b_area*area,
+    Intercept ~ dnorm(0,10),
+    b_avgfood ~ dnorm(0,10),
+    b_groupsize ~ dnorm(0,10),
+    b_area ~ dnorm(0,10),
+    sigma ~ dunif(0,10)
+    ), data = as.data.frame(df_foxes)
+  )
+
+plot(precis(m5.mh3.2))
+```
+
+`Compare the results of these models to the previous models you’ve fit, in the first two exercises. 
+
+(a) Is avgfood or area a better predictor of body weight? If you had to choose one or the other to include in a model, which would it be? Support your assessment with any tables or plots you choose. `
+```{r}
+df_foxes %>% 
+  select(avgfood, groupsize, area, weight) %>% 
+  GGally::ggscatmat()
+```
 
 
+`(b) When both avgfood or area are in the same model, their effects are reduced (closer to zero) and their standard errors are larger than when they are included in separate models. Can you explain this result?`
 
+This is because they are highly correlated.
 
 
 
