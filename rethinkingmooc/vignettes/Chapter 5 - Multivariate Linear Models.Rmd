@@ -11,12 +11,14 @@ In large data sets, every pair of variables has a statistically discernible non-
 2. Multiple Cuasation. A phenomonen may really arise from multiple causes.
 3. Interactions. Even when variables are completely uncorrelated, the importance of each may still depend upon the other.
 
-# Spurious association example
+# Spurious association
+In statistics, a spurious relationship or spurious correlation is a mathematical relationship in which two or more events or variables are not causally related to each other, yet it may be wrongly inferred that they are, due to either coincidence or the presence of a certain third, unseen factor referred to as a `confounding factor`.
 
-In this example, we'll examine `divorce rate`, `median age at marriage`, `marriage rate` in a data set where each observation is a state. Lets begin by looking at their relationships with divorce rate individually first.
+In this example, we'll examine `divorce rate`, `median age at marriage`, and `marriage rate` in a data set where each observation is a state. 
 ```{r}
 library(rethinking)
 library(tidyverse)
+library(rethinkingmooc)
 rstan_options(auto_write = TRUE)
 
 data(WaffleDivorce)
@@ -83,7 +85,7 @@ m5.3 %>%
   plot
 ```
 
-The posterior mean for marraige rate, `bR`, is now close to zero. Once we know median age at marriage for a state, there is little or no additional predictive power in also knowing the rate of marriage in that State.
+The posterior mean for marginal effect of state's `marraige rate` on `divorce rate`, `bR`, is now close to zero. Once we know median age at marriage for a state, there is little or no additional predictive power in also knowing the rate of marriage in that state.
 
 # Plotting multivariate posteriors
 
@@ -125,12 +127,14 @@ data_frame(
     theme_bw() + theme_empty() +
     ggtitle("Predictor residual plot") +
     xlab("Marriage Rate Residuals") + ylab("Divorce Rate") + 
-    annotate("text", x=-.25, y=3, label = "Younger") +
-    annotate("text", x=.2, y=3, label = "Older")
+    annotate("text", x=-.21, y=3, label = "Slower") +
+    annotate("text", x=.2, y=3, label = "Faster")
 
 ```
 
 Above, we plot the residuals from using median age at marriage to predict marriage rate against our outcome of interest. This plot displays the linear relationship between `divorce` and `marriage rates`, having statistically "controlled" for `median age of marriage`. Recall that multiple linear regression models measure the remaining association of each predictor with the outcome. By computing the predictor residual plots you perform those calculations yourself. 
+
+What does it mean for residuals to be explained well by another variables?
 
 ## Counterfactual plot
 
@@ -194,13 +198,139 @@ divorce.sim <- sim(m5.3, n=1e4)
 divorce.PI <- apply(divorce.sim, 2, PI)
 
 # Plot predicted against actual
-plot(mu.mean ~ d$Divorce, col=rangi2, ylim=range(mu.PI),
-     xlab="Observed divorce", ylab="Predicted divorce")
-abline(a=0, b=1, lty=2)
-for (i in 1:nrow(d)) {
-  lines(rep(d$Divorce[i], 2), c(mu.PI[1, i], mu.PI[2, i]), col = rangi2)
-}
+data_frame(x = d$Divorce,
+           y = mu.mean,
+           ymin=mu.PI[1,],
+           ymax=mu.PI[2,]) %>% 
+    ggplot(aes(x, y)) + 
+      geom_point(shape = 1, size = 2) +
+      geom_linerange(aes(ymin = ymin, ymax = ymax)) +
+      geom_abline(intercept = 0, slope = 1, linetype=2) + 
+      xlab("Observed Divorce") + ylab("Predictived Divorce") +
+      ggtitle("Posterior prediction plot")
 ```
+
+## Revisiting spurious predictors
+Lets create an explicit example of spurious prediction. Below, `x_real` is the actual causal parameter of interest but it is correlated with a spurious variable, `x_spur` but it is correlated with both y and x_spur
+```{r}
+N <- 100
+df <- data_frame(x_real = rnorm(N),
+                 y = rnorm(N, x_real),
+                 x_spur = rnorm(N, x_real))
+ggplot(df, aes(y=y)) +
+  geom_smooth(aes(x=x_spur), method=lm, colour="black") +
+  xlab("A spurious variable") + ggtitle("An example of spurious association") +
+  theme_empty()
+
+```
+
+# Masked relationship
+
+Bivariate relationships can be misleading when two predictor variables are correlated with each other but one variable is positively correlated with the outcome and the other is negatively correlated with it. Below, we will simulate data in which two meaningful predictors act to mask one another. 
+
+```{r}
+# Required for pair plot
+library(GGally)
+
+# number of cases
+N <- 100
+# correlation b/w x_pos and x_neg
+rho <- .7  
+
+df = data_frame(x_pos = rnorm(N),
+                x_neg = rnorm(N, rho*x_pos, 
+                              sqrt(1-rho^2)),
+                y = rnorm(N , x_pos - x_neg))
+
+GGally::ggpairs(df)
+```
+
+It looks like Y has nothing to do with either x_pos or x_neg, however, note that Y is a function of both x_pos and x_neg. A multivariate regression would pick up on this exactly.
+```{r}
+fit_fixed <- rethinking::map(
+  alist(
+    y ~ dnorm(mu, sigma),
+    mu <- a + b*x_pos + c*x_neg,
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    sigma ~ dunif(0, 10)),
+  data = as.data.frame(df))
+
+plot(precis(fit_fixed))
+```
+
+Simple bivariate regressions would miss this entirely.
+```{r}
+fit_masked <- rethinking::map(
+  alist(
+    y ~ dnorm(mu, sigma),
+    mu <- a + b*x_pos,
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    sigma ~ dunif(0, 10)),
+  data = as.data.frame(df))
+
+plot(precis(fit_masked))
+```
+
+# When adding variables hurts
+
+There are a few reasons why you don't just want to chuck every variable you have in to your data frame.
+
+1. *Multicollinearity*: Very strong correlation between two or more predictor variables. Multiple linear regression answers the question, "`What is the value of knowing each predictor, after already knowing all of the other predictors?`". In cases where variables are correlated, a single variables estimate will be deflated as its effect on the outcome is already being explained by another variable.
+2. *Post treatment bias*: 
+3. *Overfitting*:
+
+## Multicollinearity
+
+Multiple linear regression answers the question, "`What is the value of knowing each predictor, after already knowing all of the other predictors?`". In cases where variables are correlated, a single variables estimate will be deflated as its effect on the outcome is already being explained by another variable. As an example, below we regress height as a function of left and right leg length.
+```{r}
+N <- 100
+
+df <- data_frame(
+  # Each individual's height
+  height = rnorm(N, 10, 2),
+  # Leg as proportion of height
+  leg_prop = runif(N, .4, .5),
+  # left leg as proportion + error
+  leg_left = leg_prop * height + rnorm(N, 0, .02),
+  # righ tleg as proportion + error
+  leg_right = leg_prop * height + rnorm(N, 0, .02)) %>% 
+  select(height, leg_left, leg_right)
+
+m5.8 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, sigma),
+    mu <- a + bl*leg_left + br*leg_right,
+    a ~ dnorm(10, 100),
+    bl ~ dnorm(2, 10),
+    br ~ dnorm(2, 10),
+    sigma ~ dunif(0, 10)
+  ), data=as.data.frame(df))
+plot(precis(m5.8))
+```
+
+When we ask the question, `What is the value of knowing each leg's length, after already knowing the other leg's length?`, the results in the plot above should be intuitive.
+
+Recall that the posterior distribution samples every possible combination of parameters according to their plausibilities conditional on the model specification, the data, and the prior. Sampling from the posterior and plotting left and right leg length against each other shows how correlated they are.
+
+```{r}
+post <- extract.samples(m5.8, n=1e4)
+ggplot(post, aes(bl, br)) + 
+  geom_bin2d(bins=40) + theme_empty() +
+  xlab("left leg") + ylab("right leg") +
+  ggtitle("Posterior sample", "These two predictors are highly correlated")
+```
+
+In summary, including two predictor variables that are strongly correlated in your model can lead to confusion. If all you're interested in is prediction though, you have nothing to worry about.
+
+## Post treatment bias
+
+
+# Categorical variables
+
+# Ordinary least squares and lm
 
 
 
