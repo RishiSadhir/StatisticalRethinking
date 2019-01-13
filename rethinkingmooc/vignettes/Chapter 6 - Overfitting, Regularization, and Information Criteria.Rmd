@@ -1,0 +1,335 @@
+---
+title: "Chapter 6 - Overfitting, Regularization, and Information Criteria"
+output: html_notebook
+---
+
+```{r include=FALSE}
+library(rethinking)
+library(tidyverse)
+# Internal library
+library(rethinkingmooc)
+```
+
+
+# Information theory and model performance
+We want to avoid *overfitting*, learning too much from the data, and *underfitting*, learning too little from the data. Well the first thing you need to do is figure out what you want your model to be good at. Information theory provides a useful target for this called `out-of-sample deviance` and its cousins `Information Criteria`.
+
+## Joint probability is better than using average probability to judge model accuracy.
+You can draw cutoffs and rules over your models predictions but these are all just crude ways of evaluating the full joint probability distribution your model creates. Information theory lets us measure it better.
+
+
+## Information Entropy
+The uncertainty contained in a probability distribution is the average log-probability of an event. 
+
+$$
+H(p) = -E(\log (p_{i})) = - \sum_{i=1}^{n} p_i \log (p_i)
+$$
+
+The example below shows how information entropy tells us that there is less uncertainty in the weather in AbuDhabi than there is in America. 
+```{r}
+information_entropy <- function(probs) {
+  -sum(probs * log(probs))
+}
+
+list(
+  usa_weather = information_entropy(c(.3, .7)),
+  abudhabi_weather = information_entropy(c(.1, .9)))
+```
+
+## Divergence
+_Kullback-Leibler divergence_ is the additional uncertainty induced by using probabilities from one distribution to describe another distribution. We can calculate this by looking at the difference between two entropies; The entropy of the target distribution, `p` and the cross entropy arising from using `q` to predict `p`. This equation tells us how much additional uncertainty have we introduced in `p` by approximating it with `q`?
+
+$$
+D_KL(p,q) = \sum_{i}p_i(\log(p_i) - \log(q_i)) = \sum_{i}p_ilog(\frac{p_i}{q_i})
+$$
+This is the average difference in log probability between the target (p) and model (q). In the example below, we show how the closer `q` is to `p`, the less uncertainty is introduced.
+
+```{r}
+divergence <- function(p, q) {
+  sum(p * log(p/q))
+}
+
+list(
+  bad = divergence(c(.3, .7),
+                   c(.01, .99)),
+  decent = divergence(c(.3, .7),
+                      c(.25, .75)),
+  perfect = divergence(c(.3, .7),
+                       c(.3, .7)))
+
+```
+
+Divergence helps us contrast different approximations to `p`. as `q` becomes more accurate, $D_{KL}(p, q)$ will shrink.
+
+# Deviance
+In real life, we have no way of using `p` directly. What we'll do instead is compare the divergences of different candidates, say `q` and `r` and use the data as a proxy for p.
+
+$$
+D(q) = -2 \sum_{i} log(q_i)
+$$
+
+```{r}
+# Human species data
+d <- tibble::data_frame(
+  species = c("afarensis", "africanus", "habilis", "boisei", "rudolfensis", "ergaster", "sapiens"),
+  brain = c(438, 452, 612, 521, 752, 871, 1350), 
+  mass = c(37.0, 35.5, 34.5, 41.5, 55.5, 61.0, 53.5)) %>% 
+  as.data.frame
+
+# standardize the mass before fitting
+d$mass.s <- (d$mass - mean(d$mass)) / sd(d$mass)
+
+# Train brain volume as a function of body mass
+m6.8 <- rethinking::map(
+  alist(
+    brain ~ dnorm(mu, sigma),
+    mu <- a + b*mass.s),
+  data = d,
+  start = list(a = mean(d$brain),
+               b = 0,
+               sigma = sd(d$brain)),
+  method = "Nelder-Mead")
+
+# Extract MAP estimates
+theta <- rethinking::coef(m6.8)
+
+# compute deviance by summing the log likelihood 
+# of each observation given our MAP estimates. 
+# In essence, this is how we are cheating to get P.
+dev <- (-2) * sum(
+  dnorm(
+    d$brain,
+    mean = theta[1] + theta[2] * d$mass.s,
+    sd = theta[3],
+    log = TRUE))
+
+glue::glue("Deviance: {dev}")
+```
+
+Note that in reality, you want to calculate deviance on a holdout set instead of on your training set. Out-of-sample test deviance is improving if it is getting smaller.
+
+
+# Regularization
+One way to prevent the model from learning too much from it's training sample is to use a regularizing prior. A tighter prior will make your model suspicious of data that lies outside of it's distribution.
+
+```{stan}
+y i ∼ Normal(µ i ,σ)
+µ i = α + βx i
+α ∼ Normal(0,100)
+β ∼ Normal(0,1)
+σ ∼ Uniform(0,10)
+```
+
+If we assume `x` is centered and scaled in the example above, our prior for $\beta$ is telling us that a one standard deviation change in x is only 5% likely to produce a >2 unit change in y.
+
+```{r Example Priors}
+tibble::data_frame(
+  weak = rnorm(1e4, 0, 1),
+  medium = rnorm(1e4, 0, .5),
+  strong = rnorm(1e4, 0, .2)) %>% 
+  tidyr::gather(strength, value) %>% 
+  ggplot2::ggplot(ggplot2::aes(x = value, fill = strength)) +
+    ggplot2::geom_density(alpha = I(1/3)) +
+    ggplot2::coord_cartesian(xlim = c(-3, 3)) 
+
+```
+
+In practice, we can pick the right prior through routines such as cross validation.
+
+# Information Criteria
+
+`WAIC (Widely Applicable Information Criterion)` can be used to estimate out-of-sample deviance. It is defined below. Let $Pr(y_i)$ equal the average likelihood of observation $i$ in the training sample. Therefore, the first term is the average log likelihood of each data point according to our models posterior distribution. Let $V(y_i)$ as the variance in log-likelihood for observation i in the training sample.
+
+$$
+WAIC = -2(\sum_{i=1}^{N}{\log{Pr(y_i)}} - \sum_{i=1}^{N}{V(y_i)})
+$$
+
+To further illustrate this measurement, lets formally compute it using cars as an example
+
+```{r}
+# First train a model of dist as a function of speed.
+data(cars)
+m <- rethinking::map(
+  alist(
+    dist ~ dnorm(mu, sigma),
+    mu <- a + b*speed,
+    a ~ dnorm(0, 100),
+    b ~ dnorm(0, 10),
+    sigma ~ dunif(0, 30)
+  ), data = cars)
+# Extract 1000 parameter combinations from the posterior for our 3 free parameters
+post <- extract.samples(m, n = 1000)
+
+# For every observation, calculate its log likelihoods given to us by the posterior distribution
+log_likelihoods <- purrr::map(1:nrow(cars), function(i) {
+  mus <- post$a + post$b * cars$speed[i]
+  dnorm(cars$dist[i], mus, post$sigma, log = TRUE)
+})
+
+# Summarize the estimates for each observation over the posterior
+left <- purrr::map_dbl(log_likelihoods, ~ log_sum_exp(.x) - log(1000))
+right <- purrr::map_dbl(log_likelihoods, var)
+
+# Calcluate pWAIC
+WAIC <- -2*(sum(left) - sum(right))
+glue::glue("WAIC: {round(WAIC, 2)}")
+```
+
+# Model Averaging
+
+
+# Homework
+
+## Setup
+```{r}
+data("Howell1")
+d <- Howell1
+
+# Center and scale age
+# This turns its coefficients interpretation to mean
+# Unit change in the outcome from a std dev move from the mean
+d$age <- (d$age - mean(d$age)/sd(d$age))
+
+# Break in to test/train
+i <- sample(1:nrow(d), size = nrow(d) / 2)
+d1 <- d[i, ]
+d2 <- d[-i, ]
+
+m6_1 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age,
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+
+m6_2 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age + c * (age^2),
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+
+m6_3 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age + c * (age^2) + d * (age^3),
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    d ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+
+m6_4 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4),
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    d ~ dnorm(0, 10),
+    e ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+
+m6_5 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5),
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    d ~ dnorm(0, 10),
+    e ~ dnorm(0, 10),
+    f ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+
+m6_6 <- rethinking::map(
+  alist(
+    height ~ dnorm(mu, exp(log.sigma)),
+    mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5) + g * (age^6),
+    a ~ dnorm(0, 10),
+    b ~ dnorm(0, 10),
+    c ~ dnorm(0, 10),
+    d ~ dnorm(0, 10),
+    e ~ dnorm(0, 10),
+    f ~ dnorm(0, 10),
+    g ~ dnorm(0, 10),
+    log.sigma ~ dunif(0, 10)
+    ), data = d1)
+```
+
+##HH1
+```{r}
+rethinking::compare(m6_1, m6_2, m6_3, m6_4)
+```
+
+```{r}
+rethinking::coeftab(m6_1, m6_2, m6_3, m6_4)
+```
+
+
+#HH2
+```{r}
+#' summarize_preds
+#'
+#' @param x Counterfactual sequence for x-axis
+#' @param preds Posterior predictions. dim = (ncases X nsamples)
+#' @param prob Credible interval size
+#'
+#' @return data frame
+#' @export
+#'
+#' @examples
+summarize_preds <- function(x, preds, prob=.97) {
+  tibble::data_frame(
+  age_seq = x,
+  height_hat = purrr::map_dbl(preds, mean),
+  height_hat_lb = purrr::map_dbl(preds, ~ rethinking::HPDI(.x, prob)[1]),
+  height_hat_ub = purrr::map_dbl(preds, ~ rethinking::HPDI(.x, prob)[2]))
+}
+
+post <- extract.samples(m6_1)
+age.seq <- seq(from = 0 , to = 90, length.out = 100)
+preds <- purrr::map(age.seq, ~ post$a + post$b * .x)
+d <- summarize_preds(age.seq, preds)
+
+p <- ggplot(d) + 
+    geom_ribbon(aes(x = age_seq, ymin = height_hat_lb, ymax = height_hat_ub), alpha = I(1/4)) +
+    geom_line(aes(x = age_seq, y = height_hat)) +
+    geom_jitter(mapping = aes(x = age, y = height), data = d1, alpha = I(1/2))
+
+
+post <- extract.samples(m6_2)
+preds <- purrr::map(age.seq, ~ post$a + post$b * .x + post$c * (.x^2))
+d <- summarize_preds(age.seq, preds)
+p = p + geom_ribbon(mapping = aes(x = age_seq, ymin = height_hat_lb, ymax = height_hat_ub), 
+                    data = d, alpha = I(1/4)) +
+  geom_line(mapping = aes(x=age_seq, y = height_hat), data = d, colour = "steelblue")
+
+
+post <- extract.samples(m6_3)
+preds <- purrr::map(age.seq, ~ post$a + post$b * .x + post$c * (.x^2) + post$d * (.x^3))
+d <- summarize_preds(age.seq, preds)
+p = p + geom_ribbon(mapping = aes(x = age_seq, ymin = height_hat_lb, ymax = height_hat_ub), 
+                    data = d, alpha = I(1/4)) +
+  geom_line(mapping = aes(x = age_seq, y = height_hat), data = d, colour = "burlywood")
+
+
+post <- extract.samples(m6_4)
+preds <- purrr::map(age.seq, ~ post$a + post$b * .x + post$c * (.x^2) + post$d * (.x^3) + post$e * (.x^4))
+d <- summarize_preds(age.seq, preds)
+p = p + geom_ribbon(mapping = aes(x = age_seq, ymin = height_hat_lb, ymax = height_hat_ub), data = d, alpha = I(1/4)) +
+  geom_line(mapping = aes(x = age_seq, y = height_hat), data = d, colour = "thistle1")
+
+p + theme_bw() + theme_empty() + 
+  xlab("Age") + ylab("Height") + 
+  ggtitle("Various polynomial fits", "97% Credible Interval")
+```
+

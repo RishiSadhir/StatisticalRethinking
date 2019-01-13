@@ -186,7 +186,7 @@ flist <- alist(
   mu ~ dnorm(178, 20),
   sigma ~ dunif(0, 50)
 )
-m4.1 <- map(flist, data=d2)
+m4.1 <- rethinking::map(flist, data=d2)
 precis(m4.1)
 ```
 
@@ -216,7 +216,7 @@ ggplot(d2, aes(x=weight, y=height)) +
 
 The goal here is to make the parameter for the mean of a Gaussian distribution, $\mu$, into a linear function of the predictor variable. This encodes the assumption that the predictor variable has a perfectly constant and additive relationship to the mean of the outcome.
 ```{r}
-m4.3 <- map(
+m4.3 <- rethinking::map(
   alist(
     height ~ dnorm(mu, sigma),
     mu <- a + b*weight,
@@ -234,7 +234,7 @@ Centering is the procedure of subtracting the mean of a variable from each value
 ```{r}
 d2$weight.c <- d2$weight - mean(d2$weight)
 
-m4.4 <- map(
+m4.4 <- rethinking::map(
   alist(
     height ~ dnorm(mu, sigma),
     mu <- a + b*weight.c,
@@ -264,7 +264,7 @@ This line only represents one piece of the posterior. We could instead sample va
 ```{r}
 N <- 10
 dN <- d2[ 1:N , ]
-mN <- map(
+mN <- rethinking::map(
   alist(
     height ~ dnorm( mu , sigma ) ,
     mu <- a + b*weight ,
