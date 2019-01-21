@@ -3,6 +3,11 @@ title: "Chapter 5 - Multivariate Linear Models"
 output: html_notebook
 ---
 
+```{r setup}
+knitr::opts_chunk$set(fig.height = 3.5, fig.width = 5)
+```
+
+
 # Introduction
 
 In large data sets, every pair of variables has a statistically discernible non-zero correlation. Most of these relationships are non-causal. Multivariate regression can help us examine causal relatinoships by:
@@ -18,7 +23,7 @@ In this example, we'll examine `divorce rate`, `median age at marriage`, and `ma
 ```{r}
 library(rethinking)
 library(tidyverse)
-library(rethinkingmooc)
+devtools::load_all()
 rstan_options(auto_write = TRUE)
 
 data(WaffleDivorce)
@@ -29,7 +34,7 @@ d %>%
 
 
 
-```{r}
+```{r fig.height=3.5, fig.height=6}
 # Standardize the predictor `median age at marriage`
 d$MedianAgeMarriage.s <- (d$MedianAgeMarriage - mean(d$MedianAgeMarriage)) / sd(d$MedianAgeMarriage)
 
@@ -99,7 +104,7 @@ Multivariate regressions can get complicated. To interrogate them better, we can
 
 A predictor variable residual is the average prediction error when we use all of the other predictor variables to model a predictor of interest. This allows us to visualize the bivariate relationship between the predictor and the outcome while "controlling" for all of the other predictor variables.
 
-```{r}
+```{r fig.width=4.5}
 # Model marriage as a function of Median Marriage Age
 m5.4 <- rethinking::map(
   alist(
@@ -140,7 +145,7 @@ What does it mean for residuals to be explained well by another variables?
 
 In counterfactual plots, we hold all predictor variables to their mean value except for one in particular. We plot this one varying predictor against our outcome of interest. We can generate this for each predictor variable independently.
 
-```{r}
+```{r fig.width=4.5}
 # Prepare counterfactual data
 age_avg <- mean(d$MedianAgeMarriage.s)
 new_marriage_rate <- seq(from = -3, to = 3, length.out = 30)
@@ -416,7 +421,7 @@ rsample::bootstraps(df_lds, times = 1e4) %>%
   pull(splits) %>% 
   
   # Run regression on each sample
-  map(~ lm(Divorce_Rate ~ Marriage_Rate + Median_Age + Percentage_Mormon, data = .x)$coefficients) %>% 
+  purrr::map(~ lm(Divorce_Rate ~ Marriage_Rate + Median_Age + Percentage_Mormon, data = .x)$coefficients) %>% 
   
   # Pull out coefficients
   reduce(bind_rows) %>% 
@@ -469,7 +474,7 @@ mu_link <- function(area) {
   posterior_samples$Intercept + (posterior_samples$b_area * area)
 }
 # Generate predictions for each sample
-mu <- map(area_axis, mu_link)
+mu <- purrr::map(area_axis, mu_link)
 
 data_frame(
   area = area_axis,
@@ -506,7 +511,7 @@ mu_link <- function(groupsize) {
   posterior_samples$Intercept + (posterior_samples$b_groupsize * groupsize)
 }
 # Generate predictions for each sample
-mu <- map(groupsize_axis, mu_link)
+mu <- purrr::map(groupsize_axis, mu_link)
 
 data_frame(
   groupsize = groupsize_axis,
@@ -654,6 +659,214 @@ df_foxes %>%
 `(b) When both avgfood or area are in the same model, their effects are reduced (closer to zero) and their standard errors are larger than when they are included in separate models. Can you explain this result?`
 
 This is because they are highly correlated.
+
+# Recoded
+
+```{r}
+library(fiftystater)
+
+d %>% 
+  # first we'll standardize the three variables to put them all on the same scale
+  mutate(Divorce_z = (Divorce - mean(Divorce)) / sd(Divorce),
+         MedianAgeMarriage_z = (MedianAgeMarriage - mean(MedianAgeMarriage)) / sd(MedianAgeMarriage),
+         Marriage_z = (Marriage - mean(Marriage)) / sd(Marriage),
+         # need to make the state names lowercase to match with the map data
+         Location = str_to_lower(Location)) %>% 
+  # here we select the relevant variables and put them in the long format to facet with `facet_wrap()`
+  select(Divorce_z:Marriage_z, Location) %>% 
+  gather(key, value, -Location) %>% 
+  
+  ggplot(aes(map_id = Location)) +
+  geom_map(aes(fill = value), map = fifty_states, 
+           color = "firebrick", size = 1/15) +
+  expand_limits(x = fifty_states$long, y = fifty_states$lat) +
+  scale_x_continuous(NULL, breaks = NULL) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  scale_fill_gradient(low = "#f8eaea", high = "firebrick4") +
+  coord_map() +
+  theme_bw() +
+  theme(panel.grid       = element_blank(),
+        legend.position  = "none",
+        strip.background = element_rect(fill = "transparent", color = "transparent")) +
+  facet_wrap(~key)
+
+```
+
+```{r fig.height=5, fig.width=6}
+library(brms)
+data(WaffleDivorce)
+d <- WaffleDivorce
+
+d2 <- d %>%
+  mutate(MedianAgeMarriage_s = (MedianAgeMarriage - mean(MedianAgeMarriage)) / sd(MedianAgeMarriage),
+         Marriage_s = (Marriage - mean(Marriage)) / sd(Marriage))
+
+b5.3 <- 
+  brm(data = d2, family = gaussian,
+      Divorce ~ 1 + Marriage_s + MedianAgeMarriage_s,
+      prior = c(prior(normal(10, 10), class = Intercept),
+                prior(normal(0, 1), class = b),
+                prior(uniform(0, 10), class = sigma)),
+      iter = 2000, warmup = 500, chains = 4, cores = 4)
+
+plot(b5.3)
+```
+
+## Coefficient Plots
+```{r fig.height=1.5, fig.width=5.5, message=FALSE, warning=FALSE}
+library(tidybayes)
+
+tidy_coef_plot <- function(post, title="Coefficient Plot") {
+  post %>% 
+  select(-lp__) %>% 
+  gather() %>% 
+  # use `reorder()` to arrange the coefficients
+  ggplot(aes(x = value, y = reorder(key, value))) +
+  geom_vline(xintercept = 0, color = "firebrick4", alpha = 1/10) +
+  stat_pointintervalh(point_interval = mode_hdi, .width = .95, 
+                      size = 3/4, color = "firebrick4") +
+  labs(title = title,
+       x = NULL, y = NULL) +
+  theme_bw() +
+  theme(panel.grid   = element_blank(),
+        panel.grid.major.y = element_line(color = alpha("firebrick4", 1/4), linetype = 3),
+        axis.text.y  = element_text(hjust = 0),
+        axis.ticks.y = element_blank())
+}
+
+tidy_coef_plot(posterior_samples(b5.3))
+```
+
+## Categorical variables
+
+### Binary Variables
+```{r message=FALSE, warning=FALSE}
+library(rethinking)
+data(Howell1)
+d <- Howell1
+
+rm(Howell1)
+detach(package:rethinking, unload = T)
+library(brms)
+
+d %>% 
+  glimpse
+```
+
+
+```{r}
+b5.15 <- brm(data = d, family = gaussian,
+             height ~ 1 + male,
+             prior = c(prior(normal(178, 100), class = Intercept),
+                       prior(normal(0, 10), class = b),
+                       prior(cauchy(0, 2), class = sigma)),
+             iter = 2000, warmup = 500, chains = 4, cores = 4)
+plot(b5.15)
+```
+
+```{r}
+post <- posterior_samples(b5.15)
+
+post %>%
+  transmute(male_height = b_Intercept + b_male) %>% 
+  mean_qi(.width = .89)
+```
+
+```{r fig.height=1, fig.width=1.5}
+fitted(b5.15,
+       newdata = nd,
+       summary = F) %>% 
+  as_tibble() %>% 
+  
+  ggplot(aes(x = V1, y = 0)) +
+    geom_halfeyeh(fill = "firebrick4", 
+                point_interval = median_qi, .width = .95) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  labs(subtitle = "Model-implied male heights",
+       x = expression(alpha + beta["male"])) +
+  theme_bw() + theme(panel.grid = element_blank())
+```
+
+```{r}
+d2 <- d %>% 
+  mutate(female = male*-1 + 1)
+b5.15b <- brm(data = d2, family = gaussian,
+              height ~ 0 + male + female,
+              prior = c(prior(normal(178, 100), class = b),
+                        prior(cauchy(0, 2), class = sigma)),
+              iter = 2000, warmup = 500, chains = 4, cores = 4)
+plot(b5.15b)
+```
+
+
+
+```{r}
+posterior_samples(b5.15b) %>% 
+  transmute(dif = b_male - b_female) %>% 
+  
+  ggplot(aes(x = dif, y = 0)) +
+    geom_halfeyeh(fill = "firebrick4", 
+                point_interval = median_qi, .width = .95) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  labs(subtitle = "Model-implied difference score",
+       x = expression(alpha["male"] - alpha["female"])) +
+  theme_bw() +
+  theme(panel.grid = element_blank())
+```
+
+### Many Categories
+```{r}
+library(rethinking)
+data(milk)
+d <- milk
+rm(milk)
+detach(package:rethinking, unload = T)
+library(brms)
+```
+
+
+
+```{r}
+library(recipes)
+
+(d2 <- recipe(kcal.per.g ~ 1 + clade, d) %>% 
+  step_dummy(clade, one_hot = T) %>% 
+  prep(d) %>% 
+  bake(d)) %>% 
+  glimpse
+```
+
+```{r}
+b5.16 <- 
+  brm(data = d2, family = gaussian,
+      kcal.per.g ~ 0 + clade_Ape + clade_New.World.Monkey + clade_Old.World.Monkey + clade_Strepsirrhine,
+      prior = c(prior(normal(0, 1), class = b),
+                prior(uniform(0, 10), class = sigma)),
+      iter = 2000, warmup = 500, chains = 4, cores = 4,
+      control = list(adapt_delta = 0.8))
+plot(b5.16)
+```
+
+```{r fig.height=1, fig.width=3.5}
+b5.16 %>%
+  posterior_samples %>% 
+  select(starts_with("b_"), starts_with("lp__")) %>% 
+  tidy_coef_plot()
+```
+
+
+```{r}
+b5.16_alt <- 
+  brm(data = d, family = gaussian,
+      kcal.per.g ~ 0 + clade,
+      prior = c(prior(normal(.6, 10), class = b),
+                prior(uniform(0, 10), class = sigma)),
+      iter = 2000, warmup = 500, chains = 4, cores = 4,
+      refresh = 0)
+print(b5.16_alt)
+
+```
+
 
 
 

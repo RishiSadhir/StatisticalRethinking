@@ -354,6 +354,24 @@ likelihood <- c(c1=2, c2=1, c3=0)
 ```
 
 
+# BRMS
+```{r}
+library(brms)
+```
+
+Lets suppose we toss the globe 36 times and found water 24 time.
+
+```{r}
+globe_qa_brms <-
+  brm(data = list(w = 24), 
+      family = binomial(link = "identity"),
+      w | trials(36) ~ 1,
+      prior = prior(normal(.5, 1), class = Intercept),
+      control = list(adapt_delta = 0.9))
+
+posterior_summary(globe_qa_brms) %>% 
+  round(digits = 2)
+```
 
 
 

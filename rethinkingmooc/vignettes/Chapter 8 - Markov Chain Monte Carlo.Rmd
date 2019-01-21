@@ -1,0 +1,6 @@
+---
+title: "Chapter 8 - Markov Chain Monte Carlo"
+output: html_notebook
+---
+
+

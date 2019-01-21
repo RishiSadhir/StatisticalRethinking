@@ -1,6 +1,10 @@
 ---
 title: "Chapter 3 - Sampling the imaginary"
-output: html_notebook
+output:
+  html_notebook:
+    fig_height: 2
+    fig_width: 4
+    toc: yes
 ---
 
 # Notes
@@ -13,7 +17,7 @@ library(tidyverse)
 Lets begin by returning to our globe example. We are interested in estimating the proportion of the globe that is water given the data we have seen.
 ```{r}
 # Initialize a set of candidate values our parameter could take
-p_grid <- seq(from=0, to=1, length.out=1000)
+p_grid <- seq(from = 0, to = 1, length.out = 1000)
 
 # We initially believe every parameter has an equal probability of appearing
 prior <- rep(1, 1000)
@@ -30,7 +34,7 @@ posterior <- posterior / sum(posterior)
 
 # Every candidate parameter now has an associated posterior probability
 candidates <- data_frame(p_grid, prior, likelihood, posterior)
-candidates
+head(candidates)
 ```
 
 We can sample from the posterior distribution to understand the
@@ -41,7 +45,7 @@ samples <- sample(seq_len(size), prob=posterior, size=1e4, replace=TRUE)
 
 candidates[samples, ] %>% 
   ggplot(aes(p_grid)) +
-    geom_density(fill="darkgrey")
+  geom_histogram()
 ```
 
 
@@ -49,7 +53,7 @@ candidates[samples, ] %>%
 
 ### Intervals of defined boundaries
 
-We could ask the question "What is the posterior probability that th eproportion of water is less than .5?":
+We could ask the question "What is the posterior probability that the proportion of water is less than .5?":
 ```{r}
 samples <- sample(seq_len(nrow(candidates)), prob=candidates$posterior, size = 1e4, replace = TRUE)
 
@@ -390,10 +394,86 @@ posterior_predictive_distribution %>% qplot
 
 ```
 
+# Recoded
+
+## Setup
+
+The tidybayes package offers an array of convenience functions for Bayesian models. Lets show this by returning to our globe tossing example
+
+```{r}
+# how many grid points would you like?
+n <- 1000
+n_success <- 6
+n_trials  <- 9
+
+(
+  d <-
+  tibble(p_grid     = seq(from = 0, to = 1, length.out = n),
+       # note we're still using a flat uniform prior
+         prior      = 1) %>% 
+  mutate(likelihood = dbinom(n_success, size = n_trials, prob = p_grid)) %>% 
+  mutate(posterior  = likelihood * prior) %>% 
+  mutate(posterior  = posterior / sum(posterior))
+  )
+
+```
+
+```{r fig.height=2, fig.width=4}
+samples <-
+  tibble(samples = sample(d$p_grid, prob = d$posterior, size = 1e4, replace = T)) %>% 
+  mutate(sample_number = 1:n())
+
+p1 <- samples %>% 
+  ggplot(aes(sample_number, samples)) +
+  geom_line(size = 1/10) +
+  labs(x = "Sample number",
+       y = "Proportion of water (p)") +
+  theme(panel.grid = element_blank())
+
+p2 <- samples %>% 
+  ggplot(aes(x = samples)) +
+  geom_density(fill = "black") +
+  coord_cartesian(xlim = 0:1) +
+  xlab("proportion of water (p)") +
+  theme(panel.grid = element_blank())
+gridExtra::grid.arrange(p1, p2, nrow = 1)
+  
+```
+
+## Tidy Bayes
+
+```{r}
+library(tidybayes)
+
+post_median_pi <- median_qi(samples$samples, .width = .5)
+post_median_hdi <- median_hdi(samples$samples, .width = .5)
+
+p1 <- ggplot(d, aes(p_grid)) +
+  geom_ribbon(data = filter(d, p_grid > post_median_pi$ymin &
+                               p_grid < post_median_pi$ymax),
+              aes(ymin = 0, ymax = posterior),
+              fill = "grey75") +
+  geom_line(aes(y=posterior)) +
+  labs(subtitle = "50% Percentile Interval",
+       x = "proportion of water (p)",
+       y = "density") +
+  theme(panel.grid = element_blank())
 
 
+p2 <- ggplot(d, aes(p_grid)) +
+  geom_ribbon(data = filter(d, p_grid > post_median_hdi$ymin &
+                               p_grid < post_median_hdi$ymax),
+              aes(ymin = 0, ymax = posterior),
+              fill = "grey75") +
+  geom_line(aes(y=posterior)) +
+  labs(subtitle = "50% Highest Posterior Density Interval (HPDI)",
+       x = "proportion of water (p)",
+       y = "density") +
+    theme(panel.grid = element_blank())
 
 
+gridExtra::grid.arrange(p1, p2)
+```
 
 
 

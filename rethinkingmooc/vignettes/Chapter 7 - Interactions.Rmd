@@ -1,0 +1,330 @@
+---
+title: "Chapter 7 - Interactions"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_chunk$set(fig.width=5, fig.height=2.5) 
+library(rcartocolor)
+library(tidyverse)
+library(brms)
+
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+```
+
+# Notes
+
+To model deeper conditionality we need interactions. An interaction is a kind of conditioning, a way of allowing parameters (really their posterior distributions) to be conditional on further aspects of the data. The simplest kind of interaction, a linear interaction, is built by extending the lin- ear modeling strategy to parameters within the linear model. Multilevel models induce similar effects. Common sorts of multilevel models are essentially massive interaction models, in which estimates (intercepts and slopes) are conditional on clusters (person, genus, village, city, galaxy) in the data.
+
+## Building an Interaction
+We'll start by looking at the relationship between ruggedness and GDP. This relationship appears to be different in the continent of Africa.
+```{r}
+library(rethinking)
+data(rugged)
+detach(package:rethinking, unload = T)
+
+d <- as_data_frame(rugged) %>% 
+  mutate(log_gdp = log(rgdppc_2000),
+         africa = ifelse(cont_africa == 1, "Africa", "Not Africa"))
+
+d %>% 
+  ggplot(aes(x = rugged, y = log_gdp)) +
+  geom_smooth(method = lm, colour = palette[6], fill = palette[2], na.rm = TRUE) + 
+  geom_point(colour = palette[6], na.rm = TRUE) + 
+  facet_wrap(~ africa) +
+  xlab("Ruggedness Index") + ylab("Log GDP") + 
+  theme(text = element_text(family = "Courier", size = 12, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          panel.grid = element_blank(),
+          strip.background = element_rect(fill=palette[2])) +
+    scale_colour_manual(values = palette[5:7]) +
+  coord_cartesian(xlim = c(0, 5))
+```
+
+We can model this relationship directly using an interaction effect, and its better to do so in this way. 
+
+1. Parameters such as $\sigma$ can learn across the whole sample. Splitting the data and training two regressions assumes a different variance between the two groups.
+2. You can acquire probability statements about the variable you split on.
+3. You can compare models more easily.
+4. Eventually, we can borrow data across categories when fitting multilevel models.
+
+```{r}
+dd <- d %>%
+  mutate(cont_africa = as.factor(cont_africa))
+
+fit7.1 <- brm(log_gdp ~ 1 + rugged + cont_africa + rugged:cont_africa,
+              data = dd, family = gaussian,
+              prior = c(prior(normal(8, 100), class = Intercept),
+                        prior(normal(0, 1), class = b),
+                        prior(uniform(0, 10), class = sigma)),
+              iter = 2000, warmup = 1000, chains = 4, cores = 4)
+plot(fit7.1)
+```
+```{r}
+fit7.1
+```
+
+This is the easy way to examine the effect of the interaction.
+```{r eval=FALSE}
+marginal_effects_plot <- plot(marginal_effects(fit7.1, effects = "rugged:cont_africa"), 
+                              points = TRUE)
+```
+
+We'll do it manually instead for instructive purposes.
+```{r}
+nd <- tibble(rugged = rep(seq(from=0, to=8, length.out=100), 2),
+             cont_africa = as.factor(c(rep(1, 100), rep(0, 100))))
+
+fitted(fit7.1, newdata = nd) %>% 
+  as_tibble() %>% 
+  bind_cols(nd) %>% 
+  mutate(
+    cont_africa = ifelse(cont_africa == 1, "Africa", "Not Africa")) %>% 
+  ggplot(data = ., aes(x = rugged, y = Estimate, 
+                       ymin = Q2.5, ymax = Q97.5,
+                       colour = cont_africa, fill = cont_africa)) +
+    geom_ribbon(alpha = I(1/3), colour = "transparent") + 
+    geom_line() +
+    geom_jitter(data = dd, inherit.aes = FALSE, fill = palette[7],
+                aes(x = rugged, y = log_gdp), alpha = I(2/3), na.rm=TRUE) +
+    xlab("Rugedness Index") + ylab("GDP") +
+    theme(text = element_text(family = "Courier", size = 12, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          panel.grid = element_blank(),
+          legend.position = c(0, 1),
+          legend.justification = c(0, 1),
+          legend.background = element_rect(fill = "transparent"),
+          legend.title = element_blank(),
+          strip.background = element_rect(fill=palette[2])) +
+    scale_fill_manual(values = c(palette[3], palette[6])) +
+    scale_colour_manual(values = c(palette[3], palette[6]))
+```
+
+
+```{r}
+post <- posterior_samples(fit7.1) %>% 
+  mutate(ruggedness_outside_africa = b_rugged + `b_rugged:cont_africa1`,
+         ruggedness_in_africa = b_rugged,
+         difference = ruggedness_in_africa - ruggedness_outside_africa)
+
+p1 <- post %>% 
+  ggplot(aes(difference, 0)) +
+  geom_halfeyeh(.width = c(.5, .95),
+                fill = palette[6],
+                colour = palette[6]) +
+  geom_vline(xintercept = 0, linetype = 2, colour = palette[7]) +
+  xlab("Difference in the effect of ruggedness on log(GDP) : In Africa vs Out Of Africa") +
+  ylab("") +
+  theme(text = element_text(family = "Courier", size = 10, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          panel.grid = element_blank()) +
+    scale_colour_manual(values = palette[5:7])
+  
+p2 <- post %>% 
+  transmute(`In Africa` = ruggedness_outside_africa, 
+            `Outside Africa` = ruggedness_in_africa) %>% 
+  gather(Variable, Value) %>% 
+  ggplot(aes(Value, fill = Variable)) +
+    geom_density(alpha = I(.8), colour = "transparent") +
+    xlab("The effect of ruggedness on GDP") +
+    theme(text = element_text(family = "Courier", size = 10, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          panel.grid = element_blank(),
+          legend.position = c(1, 1),
+          legend.justification = c(1, 1),
+          legend.background = element_rect(fill = "transparent"),
+          legend.title = element_blank()) +
+    scale_fill_manual(values = c(palette[3], palette[6]))
+
+gridExtra::grid.arrange(p2, p1)
+```
+
+## Symmetry of the linear interaction
+The interaction there has two equally valid phrasings.
+1. How much does the influence of ruggedness (on GDP) depend upon whether the nation is in Africa?
+2. How much does the influence of being in Africa (on GDP) depend upon ruggedness?
+
+## Continuous Interactions
+
+In this section, we'll 
+```{r message=FALSE, warning=FALSE}
+library(rethinking)
+data(tulips)
+d <- as_data_frame(tulips)
+detach(package:rethinking, unload = T)
+
+d %>% skimr::skim()
+```
+
+```{r}
+# These first two have some issues
+m7.6 <- brm(blooms ~ 1 + water + shade,
+             data = d, family = gaussian,
+             prior = c(prior(normal(0, 100), class = "Intercept"),
+                       prior(normal(0, 100), class = "b"),
+                       prior(uniform(0, 100), class = "sigma")),
+             iter = 2000, warmup = 1000, chains = 4, cores = 4)
+
+m7.7 <- brm(blooms ~ 1 + water + shade + water:shade,
+             data = d, family = gaussian,
+             prior = c(prior(normal(0, 100), class = "Intercept"),
+                       prior(normal(0, 100), class = "b"),
+                       prior(uniform(0, 100), class = "sigma")),
+             iter = 2000, warmup = 1000, chains = 4, cores = 4)
+
+# So now we use better priors and listen to STAN's 
+# advice of changing adapt_delta
+b7.6 <- update(m7.6,
+               prior = c(prior(normal(0, 100), class = Intercept),
+                         prior(normal(0, 100), class = b),
+                         prior(cauchy(0, 10), class = sigma)),
+               control = list(adapt_delta = 0.9))
+
+b7.7 <- update(b7.6,
+               formula = blooms ~ 1 + water + shade + water:shade)
+
+
+loo(b7.6, b7.7)
+```
+
+Lets look at the posterior summary
+```{r}
+posterior_summary(b7.7) %>% round(digits = 2)
+```
+
+Almost all the weight went to the interaction model, b7.7.
+```{r}
+model_weights(b7.6, b7.7, weights = "waic")
+
+```
+
+Now lets try centering and scaling our estimates first.
+```{r fig.height=7}
+dd <- d %>%
+  mutate(shade_c = (shade - mean(shade)) / sd(shade),
+         water_c = (water - mean(water)) / sd(water))
+
+b7.8 <-
+  brm(data = dd, family = gaussian,
+      blooms ~ 1 + water_c + shade_c,
+      prior = c(prior(normal(130, 100), class = Intercept),
+                prior(normal(0, 100), class = b),
+                prior(cauchy(0, 10), class = sigma)),
+      iter = 2000, warmup = 1000, chains = 4, cores = 4,
+      control = list(adapt_delta = 0.9))
+
+b7.9 <- 
+  update(b7.8, 
+         formula = blooms ~ 1 + water_c + shade_c + water_c:shade_c)
+
+plot(b7.9)
+```
+
+```{r}
+posterior_samples(b7.9) %>% 
+  select(starts_with("b_")) %>% 
+  gather(Variable, Value) %>% 
+  ggplot(aes(y = fct_rev(Variable), x = Value)) +
+    geom_halfeyeh(.width = c(.95, .5), fill = palette[6]) +
+    theme(text = element_text(family = "Courier", size = 12, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          legend.position = c(0, 1),
+          legend.justification = c(0, 1),
+          legend.background = element_rect(fill = "transparent"),
+          legend.title = element_blank(),
+          strip.background = element_rect(fill=palette[2])) +
+    scale_fill_manual(values = c(palette[3], palette[6])) +
+    scale_colour_manual(values = c(palette[3], palette[6])) +
+    scale_x_continuous(breaks = seq(from=-50, to=150, length.out = 5)) +
+    ylab("Variable") + xlab("Value") + ggtitle("Coefplot")
+      
+```
+
+Here is how we interperate each of these estimates:
+
+1. `b_Intercept` is the expected value of blooms when both water and shade are at their average values.
+2. `b_shade_c` is the expected change in blooms when shade increases by one unit and water is at its average value.
+3. `b_water_c` is the expected change in blooms when water increases by one unit and shade is at its average value.
+4. `b_water_c:shade_c` is the interaction effect. It tells us the expected change in the influence of water on blooms when increasing shade by one unit. It also tells us the expected change in the influence of shade on blooms when increasing water by one unit.
+
+```{r}
+# fitted() for model b7.8
+fitted(b7.8) %>%
+  as_tibble() %>%
+  # adding fitted() for model b7.9
+  bind_rows(
+    fitted(b7.9) %>% 
+      as_tibble()
+  ) %>% 
+  # We'll want to index the models
+  mutate(fit  = rep(c("b7.8", "b7.9"), each = 27)) %>% 
+  # Here we add the data, `d`
+  bind_cols(bind_rows(d, d)) %>% 
+  # These will come in handy for `ggplot2::facet_grid()`
+  mutate(x_grid = paste("water =", water),
+         y_grid = paste("model: ", fit)) %>% 
+  
+  ggplot(aes(x = shade)) +
+  geom_ribbon(aes(ymin = Q2.5,
+                  ymax = Q97.5), 
+              fill = palette[3], alpha = 1/5) +
+  geom_line(aes(y = Estimate), 
+            color = palette[6]) +
+  geom_point(aes(y = blooms, group = x_grid), 
+             shape = 1, color = palette[7]) +
+  coord_cartesian(xlim = range(d$shade), 
+                  ylim = range(d$blooms)) +
+  scale_x_continuous("Shade (centered)", breaks = c(-1, 0, 1)) +
+  ylab("Blooms") +
+  facet_grid(y_grid ~ x_grid) +
+  theme(text = element_text(family = "Courier", size = 12, colour = palette[7]),
+          panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+          legend.position = c(0, 1),
+          legend.justification = c(0, 1),
+          legend.background = element_rect(fill = "transparent"),
+          legend.title = element_blank(),
+          strip.background = element_rect(fill=palette[2])) +
+    scale_fill_manual(values = c(palette[3], palette[6])) +
+    scale_colour_manual(values = c(palette[3], palette[6]))
+```
+
+# Homework
+
+## 7H1
+```{r}
+library(recipes)
+library(rethinking)
+data(tulips)
+d <- tulips %>% 
+  as_data_frame
+detach(package:rethinking, unload = T)
+
+dm <- recipe(blooms ~ 0 + bed + water + shade,
+       data = d) %>%
+  step_center(water, shade) %>% 
+  step_dummy(bed, one_hot = TRUE) %>%
+  prep(d) %>% 
+  bake(d)
+
+# So now we use better priors and listen to STAN's 
+# advice of changing adapt_delta
+b7h.1 <- brm(blooms ~ 0 + bed+ water + shade + water:shade,
+                data = d, family = gaussian,
+                prior = c(prior(normal(0, 100), class = b),
+                          prior(cauchy(0, 10), class = sigma)),
+                iter = 2000, warmup = 1000, chains = 4, cores = 4,
+                control = list(adapt_delta = 0.9))
+
+plot(b7h.1)
+```
+
+```{r}
+plot(marginal_effects(b7h.1,
+                      effects = "water:shade"),
+     points = T)
+```
+
+
+
+
