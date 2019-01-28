@@ -1,6 +1,8 @@
 ---
 title: "Chapter 7 - Interactions"
-output: html_notebook
+output:
+  html_document:
+    df_print: paged
 ---
 
 ```{r setup}
@@ -284,7 +286,7 @@ fitted(b7.8) %>%
           legend.justification = c(0, 1),
           legend.background = element_rect(fill = "transparent"),
           legend.title = element_blank(),
-          strip.background = element_rect(fill=palette[2])) +
+          strip.background = element_rect(fill=palette[2])) +#
     scale_fill_manual(values = c(palette[3], palette[6])) +
     scale_colour_manual(values = c(palette[3], palette[6]))
 ```

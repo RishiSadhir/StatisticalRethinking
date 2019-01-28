@@ -3,4 +3,239 @@ title: "Chapter 8 - Markov Chain Monte Carlo"
 output: html_notebook
 ---
 
+```{r setup}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(rcartocolor)
+
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+```
+
+
+# Notes
+
+## Metropolis algorithms for full joint probability exploration
+
+```{r}
+king_markov <- function(num_weeks = 1e5, current = 10) {
+  # The position vector records visits
+  positions <- rep(0, num_weeks)
+  for (i in 1:num_weeks) {
+    positions[i] <- current
+    # Consider moving to an adjacent direction
+    proposal <- current + sample(c(-1, 1), size = 1)
+    # Logic to make sure we loop around between 1 <-> 10
+    if (proposal < 1) proposal <- 10
+    if (proposal > 10) proposal <- 1
+    # An island's population is proportional to it's index
+    # Which means we'll hill climb for sure
+    # And potentially descend by chance
+    prob_move <- proposal / current
+    current <- ifelse(runif(1) < prob_move, proposal, current)
+  }
+  positions
+}
+
+weeks <- c(1e2, 1e3, 1e4, 1e5)
+
+data_frame(
+  positions = flatten_dbl(purrr::map(weeks, king_markov)),
+  lables = flatten_chr(purrr::map(weeks, ~ rep(paste(.x), .x)))) %>%
+  mutate(lables = str_c("Iterations: ", lables)) %>% 
+    ggplot(aes(positions)) +
+      geom_density(stat = "count", fill = palette[7], colour = "transparent") +
+      facet_wrap(~ lables, scales="free", labeller = labeller(label_both)) +
+      xlab("Positions") + ylab("") +
+      ggtitle("Metropolic Algorithm for MCMC", 
+              "Convergence is garaunteed asymptotically") +
+      theme_burgyl()
+
+```
+
+```{r}
+data_frame(positions = king_markov(500),
+           week = 1:length(positions)) %>%
+  ggplot(aes(week, positions)) +
+    geom_line(colour = palette[7]) +
+    geom_point(colour = palette[7]) +
+    xlab("Week") + ylab("Position") +
+    theme(text = element_text(family = "Courier", size = 10, 
+                              colour = palette[7]),
+      panel.background = element_rect(fill = alpha(palette[1], 1/4)),
+      panel.grid = element_blank(),
+      legend.position = c(1, 1),
+      legend.justification = c(1, 1),
+      legend.background = element_rect(fill = "transparent"),
+      legend.title = element_blank()) +
+    ggtitle("Metropolis Algorithm Trace")
+```
+
+The program above implements a special case of the general metrpolis algorithm for MCMC. Each island represents a parameter values, each population size is the posterior probability, and each week is a single sample from the joint posterior. 
+
+## Markov chain Monte Carlo
+
+Gibbs sampling and Hamiltonian Monte Carlo are the two leading methods out there today. 
+
+Gibbs sampling that does a better job at making movement proposals by adjusting itself intelligently depending upon what its learned about the parameters so far. It computes adaptive proposals using particular combinations of prior distributions and likelihoods known as conjugate paris. Sometimes, conjugate riors can be silly, as picking a prior so that a model fits efficiently goes against scientific inquiry. It is also inefficient when the parameter space is very large.
+
+HMC works by making its parameter suggestions more efficient. It climbs a gradient on each suggestion allowing for more effective posterior samples. This doesn't work quite as well for discrete data. It also requires a ton of tuning parameters. Luckly, `Stan` can intelligently pick these for us.
+
+## Easy HMC: brm
+
+We'll redo the ruggedness example again end to end here.
+
+```{r message=FALSE, warning=FALSE}
+library(rethinking)
+data(rugged)
+d <- rugged
+detach(package:rethinking)
+library(brms)
+library(tidybayes)
+rm(rugged)
+
+d <- d %>%
+  mutate(log_gdp = log(rgdppc_2000))
+
+dd <- d %>%
+  filter(complete.cases(rgdppc_2000))
+
+dd.trim <-
+  dd %>%
+  select(log_gdp, rugged, cont_africa)
+
+str(dd.trim)
+```
+
+Fit the log_gdp of a country as a function of ruggedness and its interaction with being in Africa.
+```{r}
+b8.1 <- brm(data = dd, family = gaussian,
+      log_gdp ~ 1 + rugged + cont_africa + rugged:cont_africa,
+      prior = c(prior(normal(0, 100), class = Intercept),
+                prior(normal(0, 10), class = b),
+                prior(cauchy(0, 2), class = sigma)),
+      refresh = 0)
+
+summary(b8.1)
+```
+
+```{r}
+post <- posterior_samples(b8.1)
+
+post %>% 
+  gather(Parameter, Samples) %>% 
+  group_by(Parameter) %>% 
+  mode_hdi(Samples, .width = c(.95))
+```
+
+```{r}
+post %>% 
+  select(starts_with("b_")) %>% 
+  gather(Variable, Value) %>% 
+  ggplot(aes(y = fct_reorder(Variable, Value, mean), x = Value)) +
+    geom_halfeyeh(.width = c(.95), fill = palette[7], colour = "transparent") +
+    geom_vline(xintercept = 0, linetype = 3) +
+    theme_burgyl() + ylab("Parameter") +
+    scale_x_continuous(breaks = seq(from=-5, to=10, by = 2))
+```
+
+```{r}
+loo(b8.1)
+```
+```{r}
+waic(b8.1)
+```
+
+```{r}
+post <- posterior_samples(b8.1, add_chain = T)
+
+mcmc_trace(post[, c(1:5, 7)],
+           facet_args = list(ncol = 3), 
+           size = .15) +
+  labs(title = "Trace plots") +
+  theme_burgyl(legend_location = "br")
+```
+
+```{r}
+mcmc_acf(post, 
+         pars = c("b_Intercept", "b_rugged", 
+                  "b_cont_africa", "b_rugged:cont_africa", 
+                  "sigma"), lags = 5) +
+  theme_burgyl()
+```
+
+## Care and feeding of your Markov Chains
+
+Below, we regress on a constant to find the mean of a vector. We provide improper flat priors that force Stan in to an unrealistic search space. The result are unrealistic estimates. 
+
+```{r}
+b8.2 <- 
+  brm(data = list(y = c(-1, 1)),
+      family = gaussian,
+      y ~ 1,
+      prior = c(prior(uniform(-1e10, 1e10), class = Intercept),
+                prior(uniform(0, 1e10), class = sigma)),
+      inits = list(list(Intercept = 0, sigma = 1),
+                   list(Intercept = 0, sigma = 1)),
+      iter = 4000, warmup = 1000, chains = 2)
+
+summary(b8.2)
+```
+
+Its obvious that these chains have not converged.
+```{r}
+plot(b8.2)
+```
+
+Lets try again with reasonable priors
+```{r}
+b8.3 <-
+  brm(data = list(y = c(-1, 1)), 
+      family = gaussian,
+      y ~ 1,
+      prior = c(prior(normal(0, 10), class = Intercept),
+                prior(cauchy(0, 1), class = sigma)),
+      inits = list(list(Intercept = 0, sigma = 1),
+                   list(Intercept = 0, sigma = 1)),
+      iter = 4000, warmup = 1000, chains = 2)
+
+summary(b8.3)
+```
+
+```{r}
+posterior_samples(b8.3) %>% 
+  select(-lp__) %>% 
+  gather(parameter) %>% 
+  ggplot(aes(x = parameter, y = value)) +
+    geom_eye(fill = alpha(palette[6], I(1/2))) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    coord_flip() + theme_burgyl()
+```
+
+More information on what to set for your priors can be found here: https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations
+
+# Homework
+
+## Hard 1
+
+```{r}
+mp <- map2stan(
+    alist(
+        a ~ dnorm(0,1),
+        b ~ dcauchy(0,1)
+    ),
+    data=list(y=1),
+    start=list(a=0,b=0),
+    iter=1e4, warmup=100 , WAIC=FALSE )
+mp %>% 
+  extract.samples() %>% 
+  as_data_frame %>% 
+  gather(Variable) %>% 
+  group_by(Variable) %>% 
+  mode_qih()
+```
+
+
 
