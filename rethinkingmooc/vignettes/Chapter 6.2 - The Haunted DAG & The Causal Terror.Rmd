@@ -1,0 +1,139 @@
+---
+title: "Chapter 6.2 - The Haunted DAG & The Causal Terror"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_chunk$set(fig.width=5, fig.height=2.5) 
+library(rcartocolor)
+library(tidyverse)
+library(magrittr)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(dagitty)
+devtools::load_all()
+
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+```
+
+
+Causality and correlation are hard to disentangle. For example, `Berkson's Paradox`, also known as _selection-distortion effect_, shows us that bad restaraunts in bad locations usually close down but have a chance to survive in good locations therefore biasing the set of observations we have available to us.
+
+
+# Multicollinearity
+Multicollinearity means strong correlation between two or more predictor variables. This can make the two variables effect measurements diffuse in the posterior. Recall that the coefficients in a multivate regression tell us the effect of a variable holding the rest still. As an example, leg length is indicative of height but if we already know the right legs length the left legs length won't give us much extra information.
+
+We'll show this with the primate milk dataset, which is highly correlated. In general, primates with high sugar in their milk feed often while high fat feed infrequently. 
+
+```{r message=FALSE, warning=FALSE}
+library(rethinking)
+data(milk)
+df <- as_data_frame(milk)
+detach("package:rethinking", unload = TRUE)
+
+df %<>%  
+  mutate(kcal.per.g = scale(kcal.per.g),
+         perc.fat = scale(perc.fat),
+         perc.lactose = scale(perc.lactose))
+
+df %>% 
+  select(kcal.per.g, perc.fat, perc.lactose) %>% 
+  cor
+```
+
+```{r modelCache1, cache=TRUE}
+fit_6.5 <- brm(kcal.per.g ~ 1 + perc.fat + perc.lactose,
+    data = df, family = gaussian,
+    prior = c(prior(normal(0, .2), class = "Intercept"),
+              prior(normal(0, .5), coef = "perc.fat"),
+              prior(normal(0, .5), coef = "perc.lactose"),
+              prior(exponential(1), class = "sigma")))
+fit_6.5
+```
+
+```{r}
+fit_6.5 %>%
+  gather_draws(`(^b_.*)|sigma`, regex = TRUE) %>% 
+  ggplot(aes(y=as_factor(.variable), x=.value)) +
+    stat_pointintervalh(.width = c(.99, .95), colour = palette[7]) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    theme_burgyl() + xlab("Value") + ylab("Parameter") +
+    ggtitle("kcals per gram in primate milk",
+            "Including two perfectly correlated variables makes their effect diffuse")
+
+```
+
+When you include two highly substitutable variables in a regression, the posterior distributin ends up describing a long ride of combinations between the two.
+
+```{r}
+fit_6.5 %>% 
+  spread_draws(`b_.*`, regex = TRUE) %>% 
+  select(starts_with("b_")) %>% 
+  cor
+```
+
+You can't always glean a solution to multicollinearity by examining a table of correlations. For example, other predictors might be correlated with only of the pair of correlated variables. There is no easy answer, we always need conceptual models based on scientific background to do useful statistics. The best course is to have a trusted causal model that tells you which variable to lean on. Sometimes, parameters are just _non-identifiable_. 
+
+# Post-treatment bias
+This occurs when you include variables that are consequences of other variables. Fungus is a result of soil treatment. So once we already know whether or not there was fungus the choice of soil treatment doesn't matter.
+
+```{r fig.height=2, fig.width=4, echo=FALSE}
+plant_dag <- dagitty("dag {
+  Height0 -> Height1
+  Fungus -> Height1
+  Treatment -> Fungus
+}")
+coordinates(plant_dag) <- 
+  list(x = c(Height0 = 0, Treatment = 2, Fungus = 1.5, Height1 = 1),
+       y = c(Height0 = 0, Treatment = 0, Fungus = 1, Height1 = 2))
+plot(plant_dag)
+```
+
+```{r}
+impliedConditionalIndependencies( plant_dag )
+```
+
+
+# Confronting confounding
+
+Confounding is any context in which the association between an outcome Y and a predictor of interest X is not the same as it would be if we had experimentally determined the values of X. Directly manipulating a variable in a DAG removes everything pointing to it.
+
+There are primarily four types of DAG relations.
+
+1. The fork: `X <- Z -> Y`. After conditioning on $Z$, $X$ tells us nothing about $Y$.
+2. The pipe: `X -> Z -> Y`. Conditioning on $Z$ blocks the path from $X$ to $Y$ so including it would shrink $X$'s coefficient. We often do not want this.
+3. The collider: `X -> Z <- Y`. Incorporating $Z$ shows that there is no real relationship between $X$ and $Y$ if we actually removed sample selection bias.
+4. Descendent variable: `X -> Z -> {Y, K}`. Conditioning on a descendent variable ($K$) is like conditioning on the variable itself but weaker. 
+
+
+Lets return to the waffle house example. 
+```{r}
+dag_6.2 <- dagitty( "dag {
+    Southern -> AgeAtMarriage -> DivorceRate
+    Southern -> MarriageRate -> DivorceRate
+    Southern -> NumWaffleHouses -> DivorceRate
+    AgeAtMarriage -> MarriageRate
+}")
+plot(dagitty::graphLayout(dag_6.2))
+```
+
+We can ask dagitty to tell us how to control for a relationship. We need to add `southern` to the regression or both `AgeAtMarriage` and `MarriageRate`. 
+```{r}
+adjustmentSets(dag_6.2, exposure = "NumWaffleHouses", outcome = "DivorceRate")
+```
+
+But is the graph correct? We can take a look at the conditional independence that the DAG suggests.
+
+```{r}
+impliedConditionalIndependencies(dag_6.2)
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,427 @@
+---
+title: "Chapter 9 - Big Entropy and the Generalized Linear Model"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_chunk$set(fig.width=4.2, fig.height=2.5) 
+library(rcartocolor)
+library(tidyverse)
+library(magrittr)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+
+devtools::load_all()
+
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+```
+
+
+# Maximum entropy
+At the end of the day, events that can happen vastly more ways are more likely. Another way of putting this is that you should bet on distributions with the biggest entropy because they are the least informative; They happen the most amount of ways given the contraints you are aware of.
+
+```{r}
+information_entropy <- function(probs_vec) {
+  probs_vec %>% 
+  map_dbl(~ .x * log(.x)) %>% 
+    reduce(add) %>% 
+    multiply_by(-1)
+}
+
+data_frame(
+  x1 = seq(from = .1, to = .9, by = .05),
+  x2 = 1 - x1,
+  `Information Entropy` = map_dbl(x1, ~ information_entropy(c(.x, 1-.x)))) %>% 
+  ggplot(aes(x1, x2, size = `Information Entropy`)) +
+    geom_segment(mapping = aes(x = .5, xend = .5, y = 0, yend = .5),
+                 inherit.aes = FALSE, linetype = 2, 
+                 colour = alpha(palette[4], .2)) +
+    geom_segment(mapping = aes(y = .5, yend = .5, x = 0, xend = .5),
+                 inherit.aes = FALSE, linetype = 2, 
+                 colour = alpha(palette[4], .2)) +
+    annotate("point", x = .5, y = .5, colour = palette[5], size = 11) +
+    geom_point(colour = palette[6]) +
+    xlab("P(heads)") + ylab("P(tails)") +
+    guides(size = guide_legend(title = "Information Entropy")) +
+    annotate("text", x = .61, y = .57, size = 5,
+             label = "Maximum Entropy", colour = palette[5]) +
+    ggtitle("Coin flips", 
+            "A fairly weighted coin has the most information entropy") +
+    theme_burgyl() +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0, 1))
+```
+
+The posterior distribution has the greatest entropy relative to the prior (the smallest cross-entropy) among all distributions consistent with the assumed constraints and the observed data. The posterior distribution has the smallest divergence from the prior that is possible while remaining consistent with the constraints and data.
+
+## Gausian
+
+The gaussian distribution is just the distribution with highest entropy whenever we enforce a finite variance constraint. The _generalized normal distribution_, shown below, is a family of distributions with finite variance. We'll now show that the normal distribution is the highest entropy distribution within that.
+
+$$
+Pr(y|\mu, \alpha, \beta) = \frac{\beta}{2\alpha\Gamma(1/\beta)} e ^{-\bigg(\frac{|y-\mu|}{\alpha}\bigg)^\beta}
+$$
+
+Lets constrain $\mu=0$ and $\sigma^2 = 1$. You can compute $\alpha$ for a given $\sigma^2$ like so: 
+
+$$
+\alpha = \sqrt{\frac{\sigma^2\Gamma(1/\beta)}{\Gamma(3/\beta)}}
+$$
+
+Lets encode that below and test this out.
+```{r}
+alpha_per_beta <- function(variance, beta){
+  sqrt((variance * gamma(1 / beta)) / gamma(3 / beta))
+}
+
+tibble(mu = 0,
+       variance = 1,
+       beta = c(1, 1.5, 2, 4)) %>%
+  mutate(alpha  = map2_dbl(variance, beta, alpha_per_beta)) %>% 
+  expand(nesting(mu, beta, alpha), 
+           value = seq(from = -5, to = 5, by = .1)) %>% 
+  # Formula for the generalized normal distribution in code
+  mutate(density = (beta / (2 * alpha * gamma(1 / beta))) * 
+             exp(1) ^ (-1 * (abs(value - mu) / alpha) ^ beta)) %>%
+  
+  ggplot(aes(x = value, y = density,
+             group = beta)) +
+  geom_line(aes(color = beta == 2,
+                size  = beta == 2)) +
+  scale_size_manual(values = c(1/4, 1.25)) +
+  scale_color_manual(values = c(palette[3],
+                                palette[4])) +
+  coord_cartesian(xlim = -4:4) +
+  theme_burgyl() + theme(legend.position = "none") +
+  ggtitle("Generalized Gaussian Distributions",
+          "Emphasize given to the normal distribution")
+```
+ Now lets see which of these has the most entropy.
+ 
+```{r}
+df <- tibble(mu = 0,
+       variance = 1,
+       # this time we need a more densely-packed sequence of `beta` values
+       beta = seq(from = 1, to = 4, length.out = 100)) %>% 
+  mutate(alpha  = map2_dbl(variance, beta, alpha_per_beta)) %>%
+  expand(nesting(mu, beta, alpha), 
+         value = -8:8) %>% 
+  mutate(density = (beta / (2 * alpha * gamma(1 / beta))) * 
+           exp(1) ^ (-1 * (abs(value - mu) / alpha) ^ beta)) %>% 
+  group_by(beta) %>% 
+  # this is just an abbreviated version of the formula we used in our first code block
+  summarise(entropy = -sum(density * log(density)))
+
+max_entropy_value <- df %>% 
+  filter(entropy == max(entropy)) %>% 
+  pull(beta)
+
+df %>% 
+  ggplot(aes(x = beta, y = entropy)) +
+    geom_vline(xintercept = max_entropy_value, 
+               colour = alpha(palette[7], .5)) +
+    geom_line(size = 2, colour = palette[7]) +
+    annotate("text", x = max_entropy_value + .36, y = 1.35,
+             label = paste("Maximum entropy at", max_entropy_value)) +
+    coord_cartesian(ylim = c(1.34, 1.42)) +
+    theme_burgyl()
+```
+
+You can see that entropy is maximized when curvature of a generalized normal distribution matches the Gaussian where shape is equal to 2.
+
+To summarize: 
+> If all we are willing to assume about a collection of measurements is that they have a finite variance, then the Gaussian distribution represents the most conservative probability distribution to assign to those measurements. But very often we are comfortable assuming something more. And in those cases, provided our assumptions are good ones, the principle of maximum entropy leads to distributions other than the Gaussian.
+
+## Binomial
+
+The binomial likelihood entials counting the numbers of ways that a given observation could arise according to assumptions. For example, if only two things can happen (blue or white marble) and there’s a constant chance $p$ of each across across $n$ trials, then the probability of observing $y$ events of type 1 and $n - y$ events of type 2 is:
+$$
+Pr(y|n,p) = \frac{n!}{y!(n-y)!}  p^y(1-p)^{n-y}
+$$
+
+The fraction with the factorials is just saying how many different ordered sequences of $n$ outcomes have a count of $y$.
+```{r}
+count_ways <- function(n, y){
+  # n = the total number of trials (i.e., the number of rows in your vector)
+  # y = the total number of 1s (i.e., successes) in your vector
+  (factorial(n) / (factorial(y) * factorial(n - y)))
+}
+
+tibble(sequence = 1:3,
+       n_trial = 4,
+       n_success = c(0, 1, 2, 3, 4)) %>% 
+  mutate(n_ways = map2_dbl(n_trial, n_success, count_ways))
+```
+
+Lets examine some candidate distributions that obey this aribtrary constraint: We expect to find one blue marble per two draws.
+```{r}
+d <- tibble(distribution = letters[1:4],
+            ww = c(1/4, 2/6, 1/6, 1/8),
+            bw = c(1/4, 1/6, 2/6, 4/8),
+            wb = c(1/4, 1/6, 2/6, 2/8),
+            bb = c(1/4, 2/6, 1/6, 1/8))
+d %>% 
+  gather(key, value, -distribution) %>% 
+  mutate(key = factor(key, levels = c("ww", "bw", "wb", "bb"))) %>% 
+  
+  ggplot(aes(x = key, y = value, group = 1)) +
+    geom_line(colour = palette[7]) +
+    geom_point(size = 4, colour = palette[7]) +
+    coord_cartesian(ylim = 0:1) +
+    labs(x = NULL, y = NULL) +
+    facet_wrap(~distribution) +
+    theme_burgyl()
+
+```
+
+The expected value of each of these distributions conforms to our expected value constraint; 
+```{r}
+d %>% 
+  gather(sequence, probability, -distribution) %>% 
+  # count the number of times "b" occurs within a given row
+  mutate(n_b = str_count(sequence, "b")) %>% 
+  mutate(product = probability * n_b) %>% 
+  group_by(distribution) %>% 
+  summarise(expected_value = sum(product))
+```
+
+As expected, the flattest distribution has the most entropy
+```{r}
+d %>% 
+  gather(sequence, probability, -distribution) %>% 
+  group_by(distribution) %>% 
+  summarise(entropy = -sum(probability * log(probability)))
+
+```
+
+> Entropy maximization, like so much in probability theory, is really just counting... There is no guarantee that this is the best probability distribution for the real problem you are analyzing. But there is a guarantee that no other distribution more conservatively reflects your assumptions.
+
+# Generalized linear models
+Gaussian distributions are only the maximum entropy distribution if the only constraint is that of finite variance. Other constraints have different maximum entropy distributions; _generalized linear models_.
+
+First, we use prior information about the possible values an outcome can take to specify the entropy maximizing distribution. Then, we replace a parameter in that distribution that describes its shape with a linear model. The linear model translates to the shape parameter via a _link function_.
+
+## Exponential Distributions
+The most common distributions used in statistical modeling are members of the _Exponential Family_.
+
+1. _Exponential Distribution_: Constrained to be 0 or positive. It is the maximum entropy distribution among all non-negative continuous distributions with the same average displacement. Its shape is described by a single parameter, the rate of events $\lambda$ or average displacement $\frac{1}{\lambda}$.
+```{r}
+seq(from = 1, to = 4, length.out = 7) %>% 
+  set_names(map_chr(., ~paste0("lambda=", .x))) %>% 
+  purrr::map_dfc(~rgamma(1e5, shape = 1, rate = .x)) %>% 
+  gather(parameter, value) %>% 
+  ggplot(aes(value, colour = parameter)) +
+    geom_density() +
+    theme_burgyl() +
+    scale_colour_manual(values = rev(palette)) +
+    ggtitle("Exponential Distribution")
+
+```
+
+2. _Gamma Distribution_: Constrained to be 0 or positive with a peak above 0. Usually applied when two or more exponentially distributed events need to happen first. It has maximum entropy among distributions with the same mean and same average logarithm. 
+
+```{r}
+1:7 %>% 
+  set_names(map_chr(., ~paste0("Shape=", .x))) %>% 
+  purrr::map_dfc(~rgamma(1e5, .x)) %>% 
+  gather(parameter, value) %>% 
+  ggplot(aes(value, colour = parameter)) +
+    geom_density() +
+    theme_burgyl() +
+    scale_colour_manual(values = rev(palette)) +
+    ggtitle("Gamma Distribution")
+```
+
+3. _Poisson Distribution_: A special case of the binomial distribution where n is large and p is small. Its shape is described by a single parameter, the rate of events $\lambda$.
+```{r}
+seq(from = 1, to = 10, length.out = 7) %>% 
+  set_names(map_chr(., ~paste0("lambda=", .x))) %>% 
+  purrr::map_dfc(~rpois(1e5, .x)) %>% 
+  gather(parameter, value) %>% 
+  ggplot(aes(value, fill = parameter)) +
+    geom_histogram(binwidth = 1) +
+    theme_burgyl() +
+    scale_fill_manual(values = rev(palette)) +
+    ggtitle("Poisson Distribution")
+
+```
+
+## Link functions
+
+Link functions map a linear model to the shape of the distribution of your outcome. `logit` and `log` links are the most popular.
+
+### Logit
+_logit link_s map a parameter defined as probability mass (and is therefore constrained to be between 0 and 1) onto a linear model that can take on any real value.
+
+$$
+logit(p_i) = log(\frac{p_i}{1-p_i}) = \alpha + \beta x_i
+$$
+Through algebra, we can solve for the probability of the event with this equation, also known as the _logistic_ equation:
+
+$$
+p_i = \frac{exp(\alpha + \beta x_i)}{1 + exp(\alpha + \beta x_i)}
+$$
+
+With this, we define the parameter's value to be the logistic transform of a linear model. The graph below shows us what this actually does. 
+```{r}
+# first, we'll make data for the horizontal lines
+alpha <- 0
+beta  <- 4
+
+lines <- tibble(
+  x = seq(from = -1, to = 1, by = .25)) %>% 
+  mutate(`log-odds`  = alpha + x * beta,
+         probability = exp(alpha + x * beta) / (1 + exp(alpha + x * beta)))
+
+
+# now we're ready to make the primary data
+beta  <- 2
+
+d <- tibble(
+  x = seq(from = -1.5, to = 1.5, length.out = 50)) %>%
+  mutate(`log-odds` = alpha + x * beta,
+         probability = exp(alpha + x * beta) / (1 + exp(alpha + x * beta))) 
+
+# now we make the individual plots
+p1 <- d %>% 
+  ggplot(aes(x = x, y = `log-odds`)) +
+  geom_hline(data = lines,
+             aes(yintercept = `log-odds`),
+             color = palette[6]) +
+  geom_line(size = 1.5, color = palette[3]) +
+  coord_cartesian(xlim = -1:1) +
+  theme_burgyl() +
+  ggtitle("Linear model", "Outcomes in the real valued space")
+
+p2 <-
+  d %>% 
+  ggplot(aes(x = x, y = probability)) +
+  geom_hline(data = lines,
+             aes(yintercept = probability),
+             color = palette[6]) +
+  geom_line(size = 1.5, color = palette[3]) +
+  coord_cartesian(xlim = -1:1) +
+  theme_burgyl() +
+  ggtitle("Probability", "Logistically constrained between 0 and 1")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+The compression created by the logistic function along the y axis afects our interpretation of parameter estiamtes because a unit change in X can produce larger or smaller changes in $p_i$ depending on how far from zero the log-odds are. This means that every predictor essentially interacts with itself because the impact of a change on a predictor depends on what the value of that predictor was before the change.
+
+### Log Link
+This link function maps a parameter that is defined over only positive real values onto a linear model. It assumes that the parameter's value is the exponentiation of the linear model.
+```{r}
+# first, we'll make data that'll be make the horizontal lines
+alpha <- 0
+beta  <- 2
+
+lines <- tibble(`log-measurement` = -3:3) %>%
+  mutate(`original measurement` = exp(`log-measurement`))
+
+# now we're ready to make the primary data
+d <- tibble(
+  x = seq(from = -1.5, to = 1.5, length.out = 50)) %>%
+  mutate(
+    `log-measurement` = alpha + x * beta,
+    `original measurement` = exp(alpha + x * beta)) 
+
+# now we make the individual plots
+p1 <- d %>% 
+  ggplot(aes(x = x, y = `log-measurement`)) +
+  geom_hline(data = lines,
+             aes(yintercept = `log-measurement`),
+             color = palette[6]) +
+  geom_line(size = 1.5, color = palette[3]) +
+  coord_cartesian(xlim = -1:1) +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = palette[5]))
+
+p2 <-
+  d %>% 
+  ggplot(aes(x = x, y = `original measurement`)) +
+  geom_hline(data = lines,
+             aes(yintercept = `original measurement`),
+             color = palette[6]) +
+  geom_line(size = 1.5, color = palette[3]) +
+  coord_cartesian(xlim = -1:1,
+                  ylim = 0:10) +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = palette[7]))
+
+# finally, we're ready to mash the plots together and behold their nerdy glory
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+
+```
+
+Once again, unit changes in X produce disproportionate changes in the outcome variable. For example, consider the guassian log link model below. Taking its derivitive with respect to $x$ shows us that the rate at which y will change due to a unit change in $x$ depends on the current value of $x$.
+$$
+y \sim guassian(\mu, \sigma)
+\\
+\mu = exp(\alpha + \beta x)
+\\
+\frac{d\mu}{dx} = \beta exp(\alpha + \beta x)
+$$
+
+Link functions operate on all parameters at once and therefor effects should be interpreted as relative differences.
+
+Warning: Only compare WAIC/LOO between models of the same likelihood distribution
+
+# Using BRMS fit arbitrary parameters
+
+First lets create a data set with two groups with identical mean and different variance.
+```{r}
+set.seed(100)
+d <- tibble(
+  x = rep(0:1, each = 100)) %>% 
+  mutate(
+    y = rnorm(n = n(), mean = 100, sd = 10 + x * 10))
+d %>% 
+  ggplot(aes(x=y, y=as.character(x))) +
+    geom_halfeyeh(aes(fill = as.character(x))) +
+    theme_burgyl() +
+    xlab("Value") + ylab("Group") +
+    scale_fill_manual(values = c(palette[4], palette[7])) +
+    theme(legend.position = "none")
+```
+
+Our outcome is gaussian but lets fit models to both parameters within it. `bf` is just a function that is shorthand for `bayesformula`. Note the use of `dpar` in our prior specification to signal which parameter we are referencing.
+```{r}
+b9.1 <- brm(data = d,
+            family = gaussian,
+            bf(y ~ 1, sigma ~ 1 + x),
+            prior = c(prior(normal(100, 10), class = Intercept),
+                      prior(normal(0, 10), class = Intercept, dpar = sigma),
+                      prior(normal(0, 10), class = b, dpar = sigma)),
+            open_progress = FALSE, refresh = 0, silent = TRUE)
+plot(b9.1)
+```
+
+As we would expect, the variance parameter is different for the different groups.
+```{r}
+posterior_samples(b9.1) %>% 
+  transmute(
+    `group 0` = b_sigma_Intercept,
+    `group 1` = b_sigma_Intercept + b_sigma_x * 1) %>% 
+  gather(group, value) %>% 
+  ggplot(aes(y = group, x = value)) +
+    geom_halfeyeh(aes(fill = group),
+                  .width = c(.95)) +
+    theme_burgyl("tl") +
+    theme(axis.line.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(),
+          legend.title = element_blank()) +
+    ylab("") +
+    scale_fill_manual(values = c(palette[3], palette[6]))
+```
+
+
+
+
+
+
+
+
+

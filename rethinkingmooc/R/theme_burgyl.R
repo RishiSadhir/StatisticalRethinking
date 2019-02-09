@@ -18,7 +18,10 @@ theme_burgyl <- function(legend_location = "tr") {
           legend.position = legend_placer(legend_location),
           legend.justification = legend_placer(legend_location),
           legend.background = element_rect(fill = "transparent",
-                                           colour = "transparent"))
+                                           colour = "transparent"),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          axis.text.x = element_text(colour = "#70284a"),
+          axis.text.y = element_text(colour = "#70284a"))
 }
 
 burgyl_palette <- c("#fbe6c5", "#f5ba98", "#ee8a82", "#dc7176", "#c8586c", "#9c3f5d", "#70284a")

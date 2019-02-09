@@ -9,6 +9,7 @@ library(brms)
 library(tidybayes)
 library(bayesplot)
 library(rcartocolor)
+devtools::load_all()
 
 colour_theme <- "BurgYl"
 palette <- carto_pal(7, colour_theme)
@@ -216,26 +217,8 @@ posterior_samples(b8.3) %>%
 
 More information on what to set for your priors can be found here: https://github.com/stan-dev/stan/wiki/Prior-Choice-Recommendations
 
-# Homework
 
-## Hard 1
 
-```{r}
-mp <- map2stan(
-    alist(
-        a ~ dnorm(0,1),
-        b ~ dcauchy(0,1)
-    ),
-    data=list(y=1),
-    start=list(a=0,b=0),
-    iter=1e4, warmup=100 , WAIC=FALSE )
-mp %>% 
-  extract.samples() %>% 
-  as_data_frame %>% 
-  gather(Variable) %>% 
-  group_by(Variable) %>% 
-  mode_qih()
-```
 
 
 
