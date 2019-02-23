@@ -112,7 +112,7 @@ Note that in reality, you want to calculate deviance on a holdout set instead of
 # Regularization
 One way to prevent the model from learning too much from it's training sample is to use a regularizing prior. A tighter prior will make your model suspicious of data that lies outside of it's distribution.
 
-```{stan}
+```
 y i ∼ Normal(µ i ,σ)
 µ i = α + βx i
 α ∼ Normal(0,100)
@@ -237,32 +237,32 @@ m6_4 <- rethinking::map(
     log.sigma ~ dunif(0, 10)
     ), data = d1)
 
-m6_5 <- rethinking::map(
-  alist(
-    height ~ dnorm(mu, exp(log.sigma)),
-    mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5),
-    a ~ dnorm(0, 10),
-    b ~ dnorm(0, 10),
-    c ~ dnorm(0, 10),
-    d ~ dnorm(0, 10),
-    e ~ dnorm(0, 10),
-    f ~ dnorm(0, 10),
-    log.sigma ~ dunif(0, 10)
-    ), data = d1)
-
-m6_6 <- rethinking::map(
-  alist(
-    height ~ dnorm(mu, exp(log.sigma)),
-    mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5) + g * (age^6),
-    a ~ dnorm(0, 10),
-    b ~ dnorm(0, 10),
-    c ~ dnorm(0, 10),
-    d ~ dnorm(0, 10),
-    e ~ dnorm(0, 10),
-    f ~ dnorm(0, 10),
-    g ~ dnorm(0, 10),
-    log.sigma ~ dunif(0, 10)
-    ), data = d1)
+# m6_5 <- rethinking::map(
+#   alist(
+#     height ~ dnorm(mu, exp(log.sigma)),
+#     mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5),
+#     a ~ dnorm(0, 10),
+#     b ~ dnorm(0, 10),
+#     c ~ dnorm(0, 10),
+#     d ~ dnorm(0, 10),
+#     e ~ dnorm(0, 10),
+#     f ~ dnorm(0, 10),
+#     log.sigma ~ dunif(0, 10)
+#     ), data = d1)
+# 
+# m6_6 <- rethinking::map(
+#   alist(
+#     height ~ dnorm(mu, exp(log.sigma)),
+#     mu <- a + b * age + c * (age^2) + d * (age^3) + e * (age^4) + f * (age^5) + g * (age^6),
+#     a ~ dnorm(0, 10),
+#     b ~ dnorm(0, 10),
+#     c ~ dnorm(0, 10),
+#     d ~ dnorm(0, 10),
+#     e ~ dnorm(0, 10),
+#     f ~ dnorm(0, 10),
+#     g ~ dnorm(0, 10),
+#     log.sigma ~ dunif(0, 10)
+#     ), data = d1)
 ```
 
 ##HH1
@@ -328,17 +328,13 @@ d <- summarize_preds(age.seq, preds)
 p = p + geom_ribbon(mapping = aes(x = age_seq, ymin = height_hat_lb, ymax = height_hat_ub), data = d, alpha = I(1/4)) +
   geom_line(mapping = aes(x = age_seq, y = height_hat), data = d, colour = "thistle1")
 
-p + theme_bw() + theme_empty() + 
+p + theme_bw() + 
   xlab("Age") + ylab("Height") + 
-  ggtitle("Various polynomial fits", "97% Credible Interval")
+  ggtitle("Various polynomial fits", "97% Credible Interval") +
+  theme(panel.grid = element_blank())
 ```
 
 # Recoded
-
-## Carto
-```{r}
-
-```
 
 ## Comparing models
 ```{r}
@@ -402,6 +398,11 @@ b6.14 <-
          inits   = inits_list)
 
 waic(b6.11, b6.12, b6.13, b6.14)
+```
+
+
+```{r}
+loo(b6.11, b6.12, b6.13, b6.14)
 ```
 
 

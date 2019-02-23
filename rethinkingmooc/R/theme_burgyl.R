@@ -3,9 +3,10 @@ theme_burgyl <- function(legend_location = "tr") {
   legend_placer <- function(ll) {
     placement <- c(1, 1)
     if (ll == "tl") placement <- c(0, 1)
-    if (ll == "tr") placement <- c(1, 1)
-    if (ll == "bl") placement <- c(0, 0)
-    if (ll == "br") placement <- c(1, 0)
+    else if (ll == "tr") placement <- c(1, 1)
+    else if (ll == "bl") placement <- c(0, 0)
+    else if (ll == "br") placement <- c(1, 0)
+    else placement <- element_blank()
     placement
   }
 

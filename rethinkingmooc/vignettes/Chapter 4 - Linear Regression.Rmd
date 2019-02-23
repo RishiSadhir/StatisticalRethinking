@@ -366,6 +366,128 @@ m4.5 <- map(
 precis( m4.5 )
 ```
 
+## B-Splines
+Splines are an alternative to modeling non-linearity. We'll show this with some cherry blossom data.
+```{r}
+library(rethinking)
+library(rcartocolor)
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+
+data(cherry_blossoms)
+d <- cherry_blossoms
+
+d %>% 
+  select(year, temp) %>% 
+  ggplot(aes(year, temp)) +
+    geom_line(colour = palette[7]) +
+    theme_burgyl()
+    
+```
+
+Splines work by defining knot points and fitting local models between them. A common way to pick these knot points is to evenly space them across the probability density of the variable. Cross validation can ultimately be used to validate the number and spacing.
+```{r}
+d2 <- d %>% 
+  filter(!is.na(temp))
+num_knots <- 15
+knot_list <- quantile(d2$year, probs = seq(0, 1, length.out = num_knots))
+d2 %>% 
+  ggplot(aes(year)) +
+  geom_density(colour = "transparent", fill = palette[5]) +
+  geom_point(data = data_frame(y= rep(0, length(knot_list)), x=knot_list),
+             mapping = aes(x, y), 
+             size = 3, colour = palette[7]) +
+  theme_burgyl() + ggtitle("Knot point allocation")
+```
+
+Now we pick the polynomial degree. This determines how many basis parameters at once are interacting with a given point. The `splines` library in R can help us with this. The code below will create 17 columns in place of year that result from its change of basis.
+```{r}
+library(splines)
+library(brms)
+
+# Split year in to basis function
+B <- bs(d2$year,
+        knots = knot_list[-c(1, num_knots)],
+        degree = 3, intercept = TRUE) %>% 
+  as_data_frame %>% 
+  set_names(., paste0("year_",names(.)))
+
+# Bind to original data frame
+d3 <- d2 %>% 
+  select(temp) %>% 
+  bind_cols(B)
+d3 %>% glimpse
+
+fit.spline <- brm(temp ~ ., family = gaussian(), data = d3,
+                  prior = c(prior(normal(6, 10), class = Intercept),
+                            prior(normal(0, 1), class = b),
+                            prior(exponential(1), class = sigma)),
+                  refresh = 0)
+posterior_summary(fit.spline)
+```
+
+Extract the predicted means and the error term.
+```{r}
+mu = as_data_frame(fitted(fit.spline))
+temp_hat = as_data_frame(predict(fit.spline))
+
+(dimensions <- list(mu = dim(mu), 
+                   temp_hat = dim(temp_hat)))
+```
+
+Plot the posterior predictions.
+```{r}
+data_frame(
+  temp = filter(d, !is.na(temp))$temp,
+  year = filter(d, !is.na(temp))$year,
+  temp_mu = mu$Estimate,
+  temp_mu_lb = mu$Q2.5,
+  temp_mu_ub = mu$Q97.5,
+  temp_hat_p = temp_hat$Estimate,
+  temp_hat_lb = temp_hat$Q2.5,
+  temp_hat_ub = temp_hat$Q97.5) %>% 
+  ggplot(aes(x = year, y = temp)) +
+    geom_jitter(alpha = .4, colour = palette[6]) +
+    geom_ribbon(aes(ymin = temp_mu_lb, ymax = temp_mu_ub), fill = alpha(palette[4], .7)) +
+    geom_ribbon(aes(ymin = temp_hat_lb, ymax = temp_hat_ub), fill = alpha(palette[4], .4)) +
+    geom_line(aes(y = temp_hat_p), colour = palette[7]) +
+    theme_burgyl() +
+    ggtitle("Posterior prediction check",
+            "Fitting temperature to a 15 knotted cubic spline of year")
+```
+
+Actually, brms can using the `s` or `t2` functions from the `mgcv` package to accomplish the same thing.
+```{r}
+fit.spline.2 <- brm(temp ~ s(year, k = 15), # 15 knots
+                    data = d2, family = gaussian(),
+                    prior = c(prior(normal(6, 10), class = Intercept),
+                            prior(normal(0, 1), class = b),
+                            prior(exponential(1), class = sigma)))
+
+mu = as_data_frame(fitted(fit.spline.2))
+temp_hat = as_data_frame(predict(fit.spline.2))
+
+data_frame(
+  temp = filter(d, !is.na(temp))$temp,
+  year = filter(d, !is.na(temp))$year,
+  temp_mu = mu$Estimate,
+  temp_mu_lb = mu$Q2.5,
+  temp_mu_ub = mu$Q97.5,
+  temp_hat_p = temp_hat$Estimate,
+  temp_hat_lb = temp_hat$Q2.5,
+  temp_hat_ub = temp_hat$Q97.5) %>% 
+  ggplot(aes(x = year, y = temp)) +
+    geom_jitter(alpha = .4, colour = palette[6]) +
+    geom_ribbon(aes(ymin = temp_mu_lb, ymax = temp_mu_ub), fill = alpha(palette[4], .7)) +
+    geom_ribbon(aes(ymin = temp_hat_lb, ymax = temp_hat_ub), fill = alpha(palette[4], .4)) +
+    geom_line(aes(y = temp_hat_p), colour = palette[7]) +
+    theme_burgyl() +
+    ggtitle("Posterior prediction check",
+            "Fitting temperature to a 15 knotted cubic spline of year")
+
+```
+
+
 ## On transformations
 
 Centering and scaling a continuous variable increases interpretability. Demeaning a predictor variable subtracts every value by it's mean. By demeaning a predictor variables, the intercept represents the value of the outcome when all variables are at their mean. One standardizes a variable by dividing every value by the variables standard deviation. Standardizing causes the interpretation of coefficients to be in terms of unit changes in SD of the variable.

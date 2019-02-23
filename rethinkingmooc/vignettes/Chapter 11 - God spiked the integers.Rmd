@@ -1,0 +1,956 @@
+---
+title: "Chapter 11 - God spiked the integers"
+output: html_notebook
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+	fig.height = 2.5,
+	fig.width = 4.2,
+	message = FALSE,
+	warning = FALSE
+)
+ 
+library(tidyverse)
+library(magrittr)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+
+devtools::load_all()
+
+library(rcartocolor)
+colour_theme <- "BurgYl"
+palette <- carto_pal(7, colour_theme)
+```
+
+# Binomial Regression
+
+The binomial distribution is denoted $y \sim Binomial(n, p)$. $y$ is a count, $p$ is the probability any particular "trial" is a success, and $n$ is the number of trials. The come in two flavors that both use the logit link function.
+
+1. _Logistic Regression_ is used when data is organized in to single-trial cases and the outcome variable is either 0 or 1.
+2. _Aggregated binomial regression_ is used when individual trials with the same covariates are aggregated together. In this case the aggregated outcome is an integer count of successes.
+
+## Logistic regression example.
+
+Lets prepare data from a chimpanzee social experiment. We use the `recipes` package to explicitly create less than full rank dummy variables.
+```{r}
+library(recipes)
+library(rethinking)
+data(chimpanzees)
+d <- as_data_frame(chimpanzees) %>% 
+  select(pulled_left, prosoc_left, condition, actor)
+rm(chimpanzees)
+detach("package:rethinking")
+
+d <- d %>% 
+  mutate(
+    treatment = 1 + prosoc_left + 2 * condition,
+    treatment = case_when(
+      treatment == 1 ~ "R/N",
+      treatment == 2 ~ "L/N",
+      treatment == 3 ~ "R/P",
+      treatment == 4 ~ "L/P"),
+    actor = as.factor(actor))
+
+df <- recipe(pulled_left ~ 0 + treatment + actor, data = d) %>% 
+  step_dummy(treatment, actor, one_hot = TRUE) %>% 
+  prep() %>% 
+  bake(new_data = d)
+
+df %>% 
+  skimr::skim()
+```
+
+Remember, our coefficients ultimately need to be interpreted in the space on the other side of the link function. What would a flat prior that we used in the gaussian world, like $normal(0, 10)$, mean in the logistic world? Well too much of that density would be piled up outside the bounds of probability making anything but 1 and 0 probable. *A flat prior in the logit space is not a flat prior in the outcome probability space.*
+
+```{r}
+rnorm(1e4, 0, 10) %>% 
+  inv_logit_scaled() %>%
+  tibble::enframe() %>% 
+  ggplot(aes(value)) +
+    geom_density(fill = palette[7], colour = "transparent") +
+    theme_burgyl() +
+    ggtitle("Improper prior - normal(0, 10)", 
+            "Priors need to be callibrated to the outcome probability space")
+```
+
+Lets try something more reasonable.
+```{r}
+rnorm(1e4, 0, 1.5) %>% 
+  inv_logit_scaled() %>% 
+  tibble::enframe() %>% 
+  ggplot(aes(value)) +
+    geom_density(fill = palette[7], colour = "transparent") +
+    theme_burgyl() +
+    ggtitle("A more proper prior", "normal(0, 1.5)")
+```
+
+Now we fit the data with a parameter for each actor and each possible treatment.
+```{r}
+b10.1 <-
+  brm(data = df, family = bernoulli,
+      pulled_left ~ 0 + .,
+      prior = prior(normal(0, 1.5), class = b),
+      refresh = 0, cores = 4)
+summary(b10.1)
+```
+
+Below we examine our coefficients. We need to convert each parameter to the outcome scale. We can do this with `brms::inv_logit_scaled`. Note how antisocial actor 2 is.
+```{r}
+post <- posterior_samples(b10.1) %>% 
+  gather(parameter, value) %>% 
+  mutate(value = inv_logit_scaled(value))
+
+p_actors <- post %>% 
+  filter(str_detect(parameter, "b_actor.*")) %>% 
+  ggplot(aes(y=parameter, x=value)) +
+    tidybayes::geom_halfeyeh(fill = palette[3]) +
+    theme_burgyl()
+
+p_treat <- post %>% 
+  filter(str_detect(parameter, "b_treat.*")) %>% 
+  ggplot(aes(y=parameter, x = value)) +
+    geom_halfeyeh(fill = palette[5]) +
+    theme_burgyl()
+
+gridExtra::grid.arrange(p_actors, p_treat, ncol = 2)
+```
+
+We can now compare the constrasts in treatments.
+```{r}
+posterior_samples(b10.1) %>% 
+  select(starts_with("b_treat")) %>% 
+  transmute(
+    ` left lever` = (b_treatment_L.N - b_treatment_L.P),
+    ` right lever` = (b_treatment_R.N - b_treatment_R.P)) %>% 
+  gather(parameter, value) %>%
+  ggplot(aes(y = parameter, fill = parameter, x = value)) +
+    geom_halfeyeh(.width = c(.5, .95)) +
+    geom_vline(xintercept = 0, colour = alpha(palette[7], .6), linetype = 2) +
+    theme_burgyl() +
+    scale_fill_manual(values = c(palette[3], palette[5])) +
+    scale_x_continuous(breaks = round(seq(from=-.6, to = 1.4, by = .2),1)) +
+    theme(legend.title = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+          ylab("") + xlab("Log odds of pulling the left lever") +
+    ggtitle("Prosocial behavior is not statistically distinguishable")
+```
+
+### Aggregated binomial
+
+When that same data is aggregated, we can switch to a binomial regression instead of a bernouli. Note the use of the `criteria | trials()` syntax.
+```{r}
+library(rethinking)
+data(chimpanzees)
+d <- chimpanzees
+detach("package:rethinking")
+
+d_aggregated <- d %>%
+  select(-recipient, -block, -trial, -chose_prosoc) %>%
+  group_by(actor, condition, prosoc_left) %>%
+  summarise(x = sum(pulled_left))
+
+d_aggregated %>%
+  filter(actor %in% c(1, 2))
+```
+
+`loo` is misleading in the aggregate case, specifically because you are leaving out aggregations at a time. Stick to the bernoulli if you want to use `loo`.
+```{r}
+b10.5 <-
+  brm(data = d_aggregated, family = binomial,
+      x | trials(18) ~ 1 + prosoc_left + condition:prosoc_left ,
+      prior = c(prior(normal(0, 10), class = Intercept),
+                prior(normal(0, 10), class = b)),
+      iter = 2500, warmup = 500, cores = 2, chains = 2,
+      refresh = 0)
+loo(b10.5)
+```
+
+### Graduate school admissions
+
+Each row is a `department-gender` with the number of acceptances out of total applications. This is just an aggregated bernoulli that we will represent as independent binomial trials to collect the effect of gender.
+```{r}
+library(rethinking)
+data(UCBadmit)
+d <- UCBadmit
+detach(package:rethinking)
+library(brms)
+rm(UCBadmit)
+d <- 
+  d %>%
+  mutate(
+    male = ifelse(applicant.gender == "male", 1, 0),
+    female = -1*male + 1)
+d %>% 
+  glimpse
+```
+
+Here is the model we are running. We use a relatively flat prior on the outcome scale.
+$$
+admission \sim Binomial(N_i, p_i)
+\\
+logit(p_i) = \alpha * male + \beta * female
+\\
+\alpha, \beta \sim Normal(0, 1.5)
+$$
+
+```{r}
+b10.6 <-
+  brm(data = d, family = binomial,
+      admit | trials(applications) ~ 0 + male + female,
+      prior = c(prior(normal(0, .15), class = b)),
+      iter = 2500, warmup = 500, cores = 4, chains = 4,
+      refresh = 0, sample_prior = "yes")
+plot(b10.6)
+```
+
+```{r}
+prior_samples(b10.6) %>% 
+  gather(parameter) %>% 
+  ggplot(aes(y = parameter, x = inv_logit_scaled(value))) +
+    geom_halfeyeh(.width = c(.95, .5),
+                  fill = palette[5],
+                  point_interval = median_hdi) +
+    theme_burgyl() +
+    ggtitle("Weakly regularizing prior for coefficients",
+            "95% and 50% highest density interval about the median")  
+```
+
+```{r}
+posterior_samples(b10.6) %>% 
+  select(starts_with("b_")) %>%
+  gather(parameter) %>% 
+  ggplot(aes(value, parameter, fill = parameter)) +
+    geom_halfeyeh() +
+    theme_burgyl("tl") + ylab("") +
+    scale_fill_manual(values = c(palette[3], palette[6])) +
+    theme(legend.title = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank())
+```
+
+
+Now lets compute the contrasts. 
+```{r}
+posterior_samples(b10.6) %>% 
+  transmute(
+    `logit scale` = b_male - b_female,
+    `outcome scale` = inv_logit_scaled(b_male) - inv_logit_scaled(b_female)) %>% 
+  gather(parameter) %>% 
+  ggplot(aes(y = parameter, x = value, fill = parameter)) +
+    geom_halfeyeh(point_interval = median_hdi,
+                  .width = c(.95, .5)) +
+    ggtitle("Men have a 12% higher acceptance rate than women",
+            "95% and 50% highest density interval about the median") +
+    theme_burgyl("tl") + ylab("") + 
+    scale_fill_manual(values = c(palette[3], palette[6])) +
+    theme_burgyl() +
+    theme(axis.text.y = element_blank(),
+          axis.ticks.y = element_blank())
+```
+
+I personally find that the interpretation is more interpretable on the outcome scale.
+```{r}
+spread_draws(b10.6, b_male, b_female) %>% 
+  transmute(diff = inv_logit_scaled(b_male) - inv_logit_scaled(b_female)) %>% 
+  median_hdi()
+```
+
+What did we just do here? Recall that this our formula for a logistic regression.
+$$
+logit(p) = -.2062730 * is\_male + -.7469153 * is\_female
+$$
+
+For each gender, we predict the following probabilities. That 12 is the difference in percentage points! Not that males are 12% mroe likely to get admitted!
+```{r}
+spread_draws(b10.6, b_male, b_female) %>% 
+  select(starts_with("b_")) %>% 
+  gather(parameter, value) %>% 
+  mutate(value = inv_logit_scaled(value)) %>% 
+  ggplot(aes(y = parameter, x = value)) +
+    tidybayes::stat_intervalh(point_interval = median_hdi)
+```
+
+Finally, lets perform a posterior prediction check. It turns out we are pretty off.
+
+> The problem in this case is that males and females do not apply to the same departments, and departments vary in their rates of admission. This makes the answer misleading. You can see the steady decline in admission probability for both males and females from department A to department F. Females in these data tended not to apply to departments like A and B, which had high overall admission rates. Instead they applied in large numbers to departments like F, which admitted less than 10% of applicants. So while it is true overall that females had a lower probability of admission in these data, it is clearly not true within most departments. 
+
+```{r}
+d %>% 
+  mutate(prediction = predict(b10.6)[,1],
+         residuals = admit - prediction) %>% 
+  group_by(dept) %>% 
+  summarise(resid = mean(residuals)) %>% 
+  arrange(desc(abs(resid)))
+```
+
+What we will now do is include variables for each department. That way the gender variables will only provide marginal information on top of the baseline acceptance rates of each department. 
+
+```{r}
+library(recipes)
+
+df <- d %>%
+  select(male, female, dept, admit, applications) %>% 
+  recipe(admit ~ applications + male + female + dept) %>% 
+    step_dummy(dept, one_hot = TRUE) %>% 
+    prep() %>% 
+    bake(new_data=d)
+
+h <- bf()
+
+b10.8 <-   brm(data = df, family = binomial,
+               admit | trials(applications) ~ 0 + male + female + 
+          dept_A + dept_B + dept_C + dept_D + dept_E + dept_F,
+      prior(normal(0, .15), class = b))
+
+summary(b10.8)
+```
+
+Lets compute the contrast again. The difference in acceptance rates is no longer significant. What happened?
+```{r}
+posterior_samples(b10.8) %>% 
+  transmute(male = inv_logit_scaled(b_male),
+            female = inv_logit_scaled(b_female),
+            diff = male - female) %>% 
+  select(diff) %>% gather(parameter) %>% 
+  ggplot(aes(y=parameter, x=value)) +
+    geom_eyeh(fill = palette[6],
+              .width = c(.5, .95)) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    theme_burgyl()
+```
+
+Department is a confound. It opens up a backdoor pipe to acceptance rates.
+```{r fig.height=.75, fig.width=1.5}
+library(dagitty)
+dag <- dagitty("dag {
+        gender -> acceptance
+        department -> acceptance
+        gender -> department
+}")
+plot(dagitty::graphLayout(dag))
+```
+
+### Multinomial and Categorical Models
+
+When more than two types of unordered events are possible, and the probability of each type of event is constant across trials, then the maximum entropy distribution is the _multinomial distribution_. Modeling this type of distribution can be done by either using a generalization of the logit link or by transforming the multinomial likelihood into a series of Poisson likelihoods. 
+
+The multinomial logit link function takes a vector of scores, one for each event type, and computes the probability of a specific event, `k`.
+
+$$
+Pr(k|s_1, s_2, \dots, s_K) = \frac {exp(s_k)} {\sum^K_{i=1}exp(s_i)}
+$$
+
+In a multinomial GLM, you need to build `K-1` linear models for `K` events, each of which can (1) use any predictor parameters it would like and (2) get assigned any predictor values it wants.
+
+Example: Predicting career choice as a function of income. Here $\beta_{INCOME}$ appears in each linear model for each possible career choice.
+```{r}
+N      <- 500
+income <- 1:3
+score  <- .5 * income
+
+# Softmax is the multinomial logit link. 
+# It just normalizes values to be in 
+# probability scale
+p <- softmax(score[1], score[2], score[3])
+
+career <- map_dbl(1:N, ~ sample(1:3, size=1, prob = p))
+
+# We choose the first event to be the "reference" event.
+# The reference type gets a constant, 
+# and the other events are defined relative to it.
+m10.16 <- map(
+    alist(
+        # multinomial logistic regression distribution
+        career ~ dcategorical( softmax(0,s2,s3) ),
+        s2 <- b*2,    # linear model for event type 2
+        s3 <- b*3,    # linear model for event type 3
+        b ~ dnorm(0,5)
+), data=list(career=career) )
+
+summary(m10.16)
+```
+
+```{r}
+N <- 100
+# simulate family incomes for each individual
+family_income <- runif(N)
+# assign a unique coefficient for each type of event
+b <- (1:-1)
+career <- rep(NA, N)  # empty vector of choices for each individual
+for ( i in 1:N ) {
+    score <- 0.5*(1:3) + b*family_income[i]
+    p <- softmax(score[1],score[2],score[3])
+    career[i] <- sample( 1:3 , size=1 , prob=p )
+}
+
+data_frame(
+  career,
+  family_income
+)
+```
+
+Alternatively, you can specify brand new parameters for your linear models. Interpretation is very difficult for models like these.
+```{r}
+m10.17 <- map(
+    alist(
+        career ~ dcategorical(softmax(0,s2,s3)),
+        s2 <- a2 + b2*family_income,
+        s3 <- a3 + b3*family_income,
+        c(a2, a3, b2, b3) ~ dnorm(0,5)
+), data=list(career=career,family_income=family_income))
+
+m10.17
+```
+
+# Poisson regression
+
+Often times, the upper limit of your binomial, $n$, is unknown. In these cases you'd want to use a poisson distriution. Recall that a binomial distributions mean is $Np$ and its variance is $Np(1-p)$. When N is very large and p is very small then these two are approximately the same.
+```{r}
+y <- rbinom(1e5, 1000, 1/1000)
+tibble(
+  mean = round(mean(y), 2),
+  var = round(var(y), 2))
+```
+This unified parameter is represented by the poisson distribution's sole parameter $\lambda$ which is the expected value of the outcome y. It is also the expected variance of the counts of y. The conventional link function for a Poisson model is the log link, which ensures our count is always positive.
+$$
+y_i \sim Poisson(\lambda_i)
+\\
+log(\lambda_i) + \alpha + \beta(x_i - \bar x)
+$$
+The log link also implies an exponential relationship between predictors and the expected value. 
+
+### Example: Oceanic tool complexity
+
+Here we examine how population size determines complexity of tools developed.
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(Kline)
+d <- as_data_frame(Kline)
+rm(Kline)
+detach("package:rethinking")
+df <- d %>% 
+  mutate(
+    log_pop = scale(log(population), center = TRUE),
+    contact_high = ifelse(contact == "high", 1, 0),
+    contact_low = ifelse(contact == "low", 1, 0))
+df %>% 
+  select(culture, population, log_pop,
+         contact_high, contact_low, total_tools) %>% 
+  skimr::skim()
+```
+
+Here is the model we'll fit:
+$$
+total\_tools \sim Poisson(\lambda_i)
+\\
+log(\lambda_i) = \alpha_{contact{[i]}} + \beta_{contact[i]}*log(population_i)
+\\
+\alpha_j \sim normal(3, .5)
+\\
+\beta_j \sim normal(0, .2)
+$$
+
+We chose our priors to make sure that they are sensible in the outcome space. The purpose of our more spiked beta prior is to dissuade our model from believing explosive exponential relationships.
+```{r}
+tibble(
+  alpha = rnorm(1e5, 3, .5),
+  beta = rnorm(1e5, 0, .2)
+) %>% 
+  gather %>% 
+  mutate(value = exp(value)) %>% 
+  filter(!is.na(value)) %>% 
+  ggplot(aes(y=key, x=value)) +
+    geom_halfeyeh(fill = palette[5]) +
+    coord_cartesian(xlim = c(0, 50)) +
+    theme_burgyl() + ylab("Prior") + xlab("exp(prior)")
+```
+
+```{r}
+b10.9 <-
+  brm(data = df, family = poisson,
+      total_tools ~ 1,
+      prior = c(prior(normal(3, .5), class = Intercept)),
+      chains = 4, cores = 4, sample_prior = "yes", refresh = 0)
+b10.9
+```
+
+
+```{r}
+df <- df %>% 
+  mutate(log_pop = log(population))
+b10.10 <-
+  brm(data = df, family = poisson,
+      total_tools ~ 0 + contact_low + contact_high + log_pop + contact_high:log_pop,
+      prior = c(prior(normal(0, 1), class = b)),
+      chains = 4, cores = 4, refresh = 0, sample_prior = "yes")
+b10.10
+```
+
+```{r}
+loo.10.10 <- loo(b10.10, save_psis = TRUE, cores = 2)
+print(loo.10.10)
+plot(loo.10.10, label_points = TRUE)
+```
+
+```{r}
+td <- tibble(
+  population = seq(from = 0, to = 275000, length.out = 250)) %>% 
+  expand(nesting(population), contact = c("low", "high")) %>% 
+  mutate(
+    log_pop = log(population),
+    contact_high = ifelse(contact == "high", 1, 0),
+    contact_low = ifelse(contact == "low", 0, 1))
+
+td <- td %>%
+  bind_cols(
+    as_data_frame(
+      predict(b10.10, newdata = td))) %>% 
+  filter(!is.nan(Estimate))
+
+p1 <- td %>% 
+  ggplot(aes(x = population, y = Estimate, 
+             ymin = `Q2.5`, ymax = `Q97.5`,
+             group = contact)) +
+  geom_ribbon(colour = "transparent", alpha = .6,
+              aes(fill = contact)) +
+  geom_line() +
+  geom_point(data = d, inherit.aes = FALSE,
+             mapping = aes(x = population, y = total_tools, 
+                           shape = contact, colour = contact)) +
+  theme_burgyl("tl") + ylab("Predicted Total Tools") +
+  scale_fill_manual(values = c(palette[3], palette[5])) +
+  scale_color_manual(values = c(palette[6], palette[7])) #+
+#  ggtitle("Posterior prediction plot",
+#          "total_tools ~ contact_low + contact_high + log_pop + contact_high:log_pop")
+p2 <- td %>% 
+  ggplot(aes(x = log_pop, y = Estimate, 
+             ymin = `Q2.5`, ymax = `Q97.5`,
+             group = contact)) +
+  geom_ribbon(colour = "transparent", alpha = .6,
+              aes(fill = contact)) +
+  geom_line() +
+  geom_point(data = d, inherit.aes = FALSE,
+             mapping = aes(x = log(population), y = total_tools, 
+                           shape = contact, colour = contact)) +
+  theme_burgyl() + ylab("") + xlab("log(population)") +
+  theme(legend.position="none") +
+  scale_fill_manual(values = c(palette[3], palette[5])) +
+  scale_color_manual(values = c(palette[6], palette[7])) 
+
+gridExtra::grid.arrange(p1, p2, ncol = 2,
+                        top = "Posterior prediction plot")
+```
+
+
+## Example: Exposure and the offset
+
+The rate parameter, $\lambda$, of a Poisson distribution can be normalized across different exposure frequencies. McElreath gives the example of combining data from a daily log and a weekly log.
+
+$$
+y_i \sim Poisson(\lambda_i)
+\\
+log(\lambda_i) = log(\frac{\mu_i}{\tau_i}) = \alpha + \beta x_i
+\\
+log(\mu_i) = log(\tau_i) + \alpha + \beta x_i
+$$
+
+$\tau$ is just a column of data, often referred to as the _offset_. Lets simulate an example to show how this works where one monestary records its manuscript completions daily while another does so weekly.
+
+```{r}
+num_days <- 30
+num_weeks <- 4
+
+d <- data_frame(
+  manuscripts = c(rpois(num_days, 1.5),
+                  rpois(num_weeks, .5 * 7)),
+  num_days = c(rep(1, 30), rep(7, 4)),
+  monastery_id = c(rep(0, 30), rep(1, 4)))
+
+
+d <- d %>% 
+  mutate(
+    log_num_days = log(num_days),
+    monastary_1 = as.numeric(monastery_id == 0),
+    monastary_2 = as.numeric(monastery_id == 1))
+
+d %>% 
+  tail(10)
+```
+
+Now lets fit the model.
+```{r}
+b10.15 <-
+  brm(data = d, family = poisson,
+      manuscripts ~ 0 + offset(log_num_days) + monastary_1 + monastary_2,
+      prior = c(prior(normal(0, 1), class = b)),
+      sample_prior = "yes", refresh = 0,
+      iter = 2500, warmup = 500, cores = 2, chains = 2)
+b10.15
+```
+
+```{r}
+rates <- fixef(b10.15) %>% 
+  as_data_frame %>% 
+  pull(Estimate) %>% 
+  exp
+subtitle <- glue("Monastary 2 produces manuscripts {round(rates[1] / rates[2], 1)} times as fast as monastary 1")
+
+posterior_samples(b10.15) %>% 
+  select(starts_with("b_")) %>% 
+  transmute(rate_diff = exp(b_monastary_1) / exp(b_monastary_2)) %>%
+  gather(Parameter, Value) %>% 
+  ggplot(aes(y = Parameter, x = Value)) +
+    geom_vline(xintercept = rates[1] / rates[2]) +
+    tidybayes::stat_intervalh(.width = c(.9, .95, .99)) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    coord_cartesian(xlim = c(0, 6)) +
+    theme_bw() + theme(panel.grid = element_blank(),
+                       axis.text.y = element_blank(),
+                       axis.ticks.y = element_blank(),
+                       legend.position = c(1, 1),
+                       legend.justification = c(1, 1),
+                       legend.background = element_rect(fill = "transparent")) +
+    ylab("") + xlab("Times increase in manuscript creation rate") +
+    annotate("text", x = 3.1, y = 1.4,
+             label = glue::glue(
+               "Median HDPI: {round(rates[1] / rates[2], 1)}")) +
+    ggtitle("Monastary 2 creates manuscripts significantly faster than Monastary 1")
+```
+
+## Multinomial in disguise as Poisson
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(UCBadmit)
+df <- as_data_frame(UCBadmit)
+detach("package:rethinking")
+df
+```
+
+```{r}
+b.binom <- brm(admit | trials(applications) ~ 1,
+               df, binomial,
+               prior = prior(normal(0, 100), class = "Intercept"),
+               refresh = 0)
+b.binom
+```
+
+
+```{r}
+df$rej <- df$reject # 'reject' is a reserved word
+m_pois <- map2stan(
+    alist(
+        admit ~ dpois(lambda1),
+        rej ~ dpois(lambda2),
+        log(lambda1) <- a1,
+        log(lambda2) <- a2,
+        c(a1,a2) ~ dnorm(0,100)
+    ),
+    data=df,  chains=3 , cores=3 )
+summary(m_pois)
+```
+
+```{r}
+k <- as.numeric(coef(m_pois))
+tibble(
+  binom_fit = inv_logit_scaled(fixef(b.binom))[,1],
+  pois_fit = exp(k[1]) / (exp(k[1]) + exp(k[2])))
+```
+
+# Censoring and survival
+
+Survival models measure _displacement_, which are continuous deviations from some point of reference. Examples of this are durations (time to discharge). When all we know is the average displacement, the exponential disgribution is the maximum entropy distribution. Alternatively, the gamma distribution is the maximum entropy distribution for fixed mean value and fixed mean magnitude. 
+
+Suvival models also deal with _censoring_, which is when some other event happens and gets in the way of measuring the event of interest (death instead of discharge).
+
+## Cats example
+
+Lets examine cats in Austin where we are interested in the time until their adoption. We have one entry per cat in the data set.
+
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(AustinCats)
+d <- as_data_frame(AustinCats) %>% 
+  mutate(adopt = ifelse(out_event == "Adoption", 1L, 0L))
+rm(AustinCats)
+detach("package:rethinking")
+(d %>% 
+  transmute(id,
+            adopt, 
+            days_to_event, 
+            is_black = as.integer(color=="Black")) ->
+  d)
+```
+
+We'll run the following model to predict the number of days. For adopted cats, the days to adoption is exponentially distributed and easy to encode. For non-adopted cats, we employ the cumulative probability distribution which gives the proportion of cats adopted before or at a certain number of days. Therefore, $1 - cumulative\_distribution$ gives the proportion of cats not yet adopted at day $d$. This is called the complementary cumulative probability distribution and is displayed in the second line below. 
+
+$$
+D_i | A_i = 1 \sim Exponential(\lambda_i)
+\\
+D_i | A_i = 0 \sim ExponentialCCDF(\lambda_i)
+\\
+\lambda_i = \frac{1}{\mu_i}
+\\
+log \mu_i = \alpha_{CID[i]}
+$$
+
+
+Lets run this in STAN.
+
+```{r}
+m11.14 <- ulam(
+  alist(
+    days_to_event | adopted == 1 ~ exponential(lambda),
+    days_to_event | adopted == 0 ~ custom(exponential_lccdf(!Y | lambda)),
+    lambda <- 1.0 / mu,
+    # Fit to log mu for numeric stability
+    log(mu) <- a[color_id],
+    a[color_id] ~ normal(0, 1)
+  ), 
+  data = list(
+    days_to_event = as.numeric(d$days_to_event),
+    color_id = ifelse(d$color=="Black", 1L, 2L),
+    adopted = d$adopt),
+  chains = 4, cores = 4)
+
+precis(m11.14, 2)
+```
+
+
+```{r}
+post <- as_data_frame(extract.samples(m11.14)$a) %>% 
+  rename(black = V1,
+         other = V2)
+post %>% 
+  gather(colour) %>% 
+  mutate(value = exp(value)) %>% 
+  ggplot(aes(x = value, y = colour)) +
+    geom_halfeyeh(.width = c(.95, .5)) +
+    theme(panel.background = element_rect(fill   = "transparent",
+                                          colour = "black")) +
+    xlab("Days to adoption") + ylab("Cat colour")
+```
+
+
+
+# Homework
+
+## 10H3
+
+First lets gather and preprocess the data.
+
+```{r}
+library(MASS)
+data(eagles)
+df <- as_data_frame(eagles)
+rm(eagles)
+detach("package:MASS")
+df <- df %>% 
+  transmute(
+    successes = y,
+    attempts = n,
+    pirate_size = ifelse(P == 'L', "large", "small"),
+    adult = ifelse(A == "I", "immature", "adult"),
+    victim_size = ifelse(V == "L", "large", "small"))
+
+library(recipes)
+
+df <- df %>% 
+  recipe(successes ~ .) %>% 
+  step_dummy(pirate_size, adult, victim_size, one_hot = TRUE) %>% 
+  prep %>% 
+  juice
+
+df
+```
+
+We drop the intercept and include all factor levels of our binary variables.
+```{r}
+hypothesis <- bf(successes | trials(attempts) ~ 0 + .)
+get_prior(hypothesis, family = binomial, data = df)
+```
+
+Our `stan` estimates look solid so lets just run with those.
+```{r}
+fit.10h3 <- brm(family = binomial, data = df,
+                formula = hypothesis,
+                prior = c(prior(normal(0, 4), class = b)),
+                chains = 4, cores = 4, refresh = 0)
+plot(fit.10h3)
+```
+
+Lets take a look at our estimates on the outcome scale.
+```{r}
+posterior_samples(fit.10h3) %>% 
+  select(starts_with("b_")) %>% 
+  gather(parameter, value) %>% 
+  mutate(value = inv_logit_scaled(value)) %>%
+  ggplot(aes(y=parameter, x = value)) +
+    geom_halfeyeh(.width = c(.5, .95))
+```
+
+
+
+
+
+```{r}
+as_data_frame(predict(fit.10h3, newdata = df)) %>% 
+  bind_cols(index=1:nrow(df), df, .) %>% 
+  ggplot(aes(x = index, colour = as.factor(pirate_size_large), shape = as.character(adult_adult))) +
+    geom_crossbar(aes(y = Estimate/attempts, ymin = `Q2.5`/attempts, ymax = `Q97.5`/attempts)) +
+    geom_point(aes(y = successes/attempts), size = 3) +
+    theme(panel.grid = element_blank())
+```
+
+```{r}
+fit.10h3.2 <- update(fit.10h3, refresh = 0,
+                     formula = bf(successes | trials(attempts) ~ 1 + adult_adult +
+                                                       pirate_size_large +
+                                                       victim_size_large +
+                                                       adult_adult:pirate_size_large))
+fit.10h3.2
+
+```
+
+```{r}
+plot(fit.10h3.2)
+```
+
+
+```{r}
+waic(fit.10h3, fit.10h3.2)
+```
+```{r}
+loo(fit.10h3, fit.10h3.2, reloo = TRUE)
+```
+
+
+## 10H.4
+
+First lets load the data and take a look at it.
+```{r message=FALSE, warning=FALSE}
+library(rethinking)
+data(salamanders)
+df <- as_data_frame(salamanders)
+rm(salamanders)
+detach("package:rethinking")
+
+df <- df %>% 
+  transmute(
+    site = SITE,
+    num_salaman = SALAMAN,
+    pct_cover = PCTCOVER,
+    age_trees = FORESTAGE)
+
+df %>% skimr::skim()
+```
+
+Now for some preprocessing. We want to try a few different transformations of our predictors.
+```{r}
+dm <- df %>% 
+  mutate(log_age_trees = log(age_trees)) %>% 
+  filter(is.finite(log_age_trees)) %>% 
+  mutate(
+    pct_cover_cs = scale(pct_cover),
+    log_age_trees_cs = scale(log_age_trees),
+    age_trees_cs = scale(age_trees))
+
+dm %>% head
+```
+
+Interestingly, the best performing model only uses the percent of coverage. It appears the age of trees adds too much noise and does not generalize well.
+```{r}
+fit.10h.4.1 <- brm(num_salaman ~ 1, refresh = 0,
+                 family = poisson(), data = dm,
+                 prior = c(
+                   prior(normal(0, 1), class = "Intercept")),
+                 sample_prior = "yes", refresh = 0,
+                 chains = 4, cores = 4)
+
+fit.10h.4.2 <- update(fit.10h.4.1, newdata = dm, refresh = 0,
+                      num_salaman ~ 1 + pct_cover_cs,
+                      prior = c(
+                        prior(normal(0, 1), class = "Intercept"),
+                        prior(normal(0, .5), class = "b")))
+
+fit.10h.4.3 <- update(fit.10h.4.2, newdata = dm, refresh = 0,
+                      num_salaman ~ 1 + pct_cover_cs + age_trees_cs)
+
+fit.10h.4.4 <- update(fit.10h.4.3, newdata = dm, refresh = 0,
+                      num_salaman ~ 1 + pct_cover_cs + log_age_trees_cs)
+
+loo(fit.10h.4.1, fit.10h.4.2, fit.10h.4.3, fit.10h.4.4,
+    reloo = TRUE)
+```
+
+We can interpret the winning model like so:
+
+1. When the percent of coverage is at its average value (60.3), we'll find 1.7 salamanders per plot.
+2. A single standard deviation change in coverage (+/- 35.1) will cause a 2.76 increase in the rate of salamanders found per plot.n
+
+```{r}
+fixef(fit.10h.4.2)[,1] %>% 
+  exp
+
+posterior_samples(fit.10h.4.2) %>% 
+  select(starts_with("b_"), starts_with("prior")) %>% 
+  gather(parameter, value) %>% 
+  mutate(value = exp(value)) %>% 
+  ggplot(aes(y=parameter, x = value)) +
+    geom_halfeyeh() + 
+    theme_bw() +
+    ggtitle("Posterior distribution for effect estimates")
+```
+
+## Frequentist approach
+
+Just to gut check my bayesian findings, lets prove that the simpler model works 
+ 
+```{r}
+library(rsample)
+library(yardstick)
+
+formula.int                <- formula(num_salaman ~ 1)
+formula.cover.cs           <- formula(num_salaman ~ 1 + pct_cover_cs)
+formula.cover.trees        <- formula(num_salaman ~ 1 + pct_cover_cs + age_trees)
+formula.cover.logtrees     <- formula(num_salaman ~ 1 + pct_cover_cs + log_age_trees)
+formula.covercs.logtreescs <- formula(num_salaman ~ 1 + pct_cover_cs + log_age_trees_cs)
+
+fit_model <- function(splits, formula) {
+  fit.none <- glm(formula, 
+                  family = poisson(), data = analysis(splits))
+  
+  holdout <- assessment(splits)
+  preds <- predict(fit.none, newdata = holdout)
+  
+  rmse_vec(holdout$num_salaman, preds)
+}
+
+bootstraps(dm, times = 1000) %>%
+  mutate(
+    intercept          = map_dbl(splits, ~ fit_model(.x, formula.int)),
+    cover_cs           = map_dbl(splits, ~ fit_model(.x, formula.cover.cs)),
+    cover_trees        = map_dbl(splits, ~ fit_model(.x, formula.cover.trees)),
+    cover_logtrees     = map_dbl(splits, ~ fit_model(.x, formula.cover.logtrees)), 
+    covercs_logtreescs = map_dbl(splits, ~ fit_model(.x, formula.covercs.logtreescs))) %>% 
+  as.data.frame %>% 
+  select(-splits, -id) %>% 
+  gather(model, rmse) %>% 
+  group_by(model) %>% 
+  mean_hdi() %>% 
+  arrange(rmse)
+```
+
+
+
+
+
+
+
+
+
+
+
+
