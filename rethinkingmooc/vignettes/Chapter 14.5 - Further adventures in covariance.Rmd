@@ -1,0 +1,97 @@
+---
+title: "Chapter 14.5 - Further adventures in covariance"
+output: html_notebook
+---
+
+```{r setup}
+library(dagitty)
+library(tidyverse)
+library(brms)
+library(tidybayes)
+```
+
+
+
+# Instrumental Variables
+Just because there is correlation between education and wage does not mean anything causal. There are unobservables that influence both wage and level of education, such as IQ. Causality can still be teased out in this scenario through _instrumental variables_. An IV is a variable that exerts direct influence on education without directly influencing wages.
+```{r}
+dag_edu_wage <- dagitty('dag {
+    Q [pos="0,-1.5"]
+    E [pos="1,0"]
+    U [pos="2,-1.5"]
+    W [pos="3,0"]
+
+    Q -> E
+    E -> W
+    E <- U -> W
+}')
+plot(dag_edu_wage)
+```
+
+In the wage/edu example, our instrumental variable of choice is birth time of year. Due to fixed semester dates, birth time of year induces variation in education without influencing wage (we would hope). 
+
+Lets simulate this data
+```{r}
+set.seed(73)
+n <- 500
+dat_sim <- tibble(
+  U = rnorm(N),
+  Q = sample(1:4 , size=N , replace=TRUE),
+  E= rnorm(N , U + Q),
+  # Assume .2
+  W = rnorm(N , U + .2*E))
+
+dat_sim %>% 
+  str
+```
+
+
+$$
+\begin{align}
+\begin{pmatrix} wage_i \\ education_i \end{pmatrix} & \sim MVNormal(\begin{pmatrix} \mu_{wage,i} \\ \mu_{education,i} \end{pmatrix}, \textbf{S}) & \text{[Wage & Education co-vary]}
+\\
+\mu_{wage, i} & = \alpha_w + \beta_{education->wage}education_i
+\\
+\mu_{education,i} & = \alpha_{education} + \beta_{quarter->education}quarter_i
+\\
+\alpha_{wage}, \alpha_{education} &\sim Normal(0, .2)
+\\
+\beta_{education->wage}, \beta_{quarter->education} &\sim Normal(0, .5)
+\\
+\textbf{S} & \sim \begin{bmatrix} \sigma_{wage} & 0 \\ 0 & \sigma_{education} \end{bmatrix} \textbf{R} \begin{bmatrix} \sigma_{wage} & 0 \\ 0 & \sigma_{education} \end{bmatrix} 
+\\
+\textbf{R} & \sim lkjCorr(2)
+
+\end{align}
+$$
+```{r}
+bform <- 
+  bf(W ~ 1 + E, family = gaussian) +
+  bf(E ~ 1 + Q, family = gaussian)
+
+b14.5 <- brm(bform,
+             data = dat_sim,
+             prior = c(prior(normal(0, .2), class = Intercept),
+                       prior(normal(0, .5), class = b),
+                       prior(exponential(1), class = "sigma", resp = E),
+                       prior(exponential(1), class = "sigma", resp = W),
+                       prior(lkj(2), class = rescor)),
+    refresh = 0, sample_prior = "yes")
+
+summary(b14.5)
+```
+
+Now, we'll compare the results to what would happen if we ignored the confounder
+```{r}
+b14.5.1 <- brm(W ~ 1 + E,
+               data = dat_sim,
+               prior = c(prior(normal(0, .2), class = Intercept),
+                         prior(normal(0, .5), class = b)),
+               refresh = 0)
+summary(b14.5.1)
+```
+
+
+# Social Relations
+
+# Continuous categories (Gaussian Process)

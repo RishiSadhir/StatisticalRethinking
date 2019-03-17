@@ -1,0 +1,551 @@
+---
+title: "Chapter 12 - Monsters and Mixtures"
+output: html_notebook
+---
+
+```{r setup}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(brms))
+suppressPackageStartupMessages(library(tidybayes))
+```
+
+# Over dispersed outcomes
+For count related processes, sometimes the outcome variable has more variance than expected even after conditioning on as much as we can. We can mitigate the effect of over-dispersion by using _continuous mixture_ models which attach linear models to the distribution of observations.
+
+## Beta-binomial
+A beta-binomial model assumes that each binomial count observation has its own probability of success. The model estimates the distribution of probabilities of success across cases, instead of a single probability of success. And predictor variables change the shape of this distribution, instead of directly determining the probability of each success.
+
+```{r}
+crossing(
+  pbar = c(.25, .5, .75),
+  theta = c(2, 15, 30),
+  x = seq(from = 0, to = 1, length.out = 100)) %>% 
+  mutate(
+    density = rethinking::dbeta2(x, pbar, theta)) %>% 
+  ggplot(aes(x = x, y = density)) +
+    geom_ribbon(aes(x = x,
+                    ymin = 0,
+                    ymax = density)) +
+    facet_grid(theta ~ pbar,
+               labeller = label_both) +
+    theme(panel.grid = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text = element_blank()) +
+  scale_x_continuous(breaks = seq(from = 0, to = 1, by = .2))
+```
+
+In betabinomial models, we fit a linear model to the `pbar` parameter to govern the central tendency of the probability distribution by conditioning on covariates.
+
+The admission data below is over-dispersed if we ignore department. This is because the departments vary a lot in baseline admission rates. We’ve already seen that ignoring this variation leads to an incorrect inference about applicant gender. Now let’s fit a beta-binomial model, ignoring department, and see how it picks up on the variation that arises from the omitted variable.
+
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(UCBadmit)
+df <- as_data_frame(UCBadmit) %>% 
+  mutate(applicant_male = ifelse(applicant.gender == "male", 1, 0),
+         applicant_female = applicant_male * -1 + 1)
+rm(UCBadmit)
+
+
+m12.1 <- ulam(
+  alist(
+    admit ~ dbetabinom(applications, pbar, theta),
+    logit(pbar) <- a*applicant_male + b*applicant_female,
+    c(a, b) ~ dnorm(0, 1.5),
+    theta ~ dexp(1)
+  ), 
+  data = list(
+    admit = df$admit, 
+    applications = df$applications, 
+    applicant_male = as.integer(df$applicant_male),
+    applicant_female = as.integer(df$applicant_female)),
+  chains = 4)
+
+extract.samples(m12.1) %>% 
+  as_data_frame %>% 
+  transmute(diff = inv_logit_scaled(a) - inv_logit_scaled(b)) %>% 
+  gather() %>% 
+  mutate(value = value * 100) %>% 
+  ggplot(aes(value, key)) +
+    geom_halfeyeh() +
+    geom_vline(xintercept = 0, linetype = 2) +
+    ylab("") + xlab("Basis point impact") +
+    ggtitle("Difference in probability of admission",
+            "p(admit | male) - p(admit | female)") +
+    theme(panel.grid = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank())
+```
+
+The beta-binomial model creates fixed effect for each row in the data - each combination of department and gender.
+
+## Negative-binomial (Gamma-Poisson)
+
+Here, we assume that each Poisson count observation has its own rateand estimates the shape of a gamma distribution to describe the POisson rates across cases. So basically, its the same as a beta-binomial model except that we use a gamma distribution of rates instead of a beta distribution of $p(succes)$'s.
+
+Lets show this one more time with the UCB admit data.
+
+```{r}
+b12.3 <- brm(data = df, family = negbinomial,
+             admit ~ 1 + applicant.gender,
+             prior = c(prior(normal(0, 10), class = Intercept),
+                       prior(normal(0, 1), class = b),
+                       prior(gamma(0.01, 0.01), class = shape)),
+    iter = 4000, warmup = 1000, cores = 2, chains = 2,
+    refresh = 0)
+print(b12.3)
+```
+
+```{r}
+post <- gather_draws(b12.3, b_applicant.gendermale) %>% 
+  mutate(.value = exp(.value))
+
+male_marginal_effect <- post %>%
+  median_hdi() %>% 
+  select(.lower, .upper, .value) %>% 
+  as.numeric() %>% 
+  round(1)
+
+post %>% 
+  ggplot(aes(x = .value)) +
+    geom_density(colour = "transparent", fill = "black") +
+    scale_y_continuous(NULL, breaks = NULL) +
+    geom_vline(xintercept = male_marginal_effect,
+               colour = "grey82", linetype = 3) +
+    geom_segment(aes(x = .5, xend = 4.2, y = 0, yend = 0), size = 1, 
+                 colour = "white", position = position_nudge(y=-.01)) +
+    geom_point(aes(x = 1.8, y = 0), colour = "white", fill = "white", 
+               size = 2.5, position = position_nudge(y=-.01)) +
+    scale_x_continuous(breaks = male_marginal_effect) +
+    theme(panel.background = element_rect(fill = "grey82"),
+          panel.grid = element_blank()) +
+  ggtitle("Marginal effect of being male on admission rate",
+          "95% median highest density interval") +
+  xlab("Additional basis points")
+  
+```
+
+# Zero inflated outcomes
+Sometimes, the process creating your counts gets thrown off. For example, maybe your shoppers get drunk and don't make purchases. Or maybe your manuscript writing monks get drunk and don't produce manuscripts. To solve this problem, we create a _mixture_ of two process, one that determines drinking vs. working, and one that determines manuscripts created given that they are working.
+$$
+y_i \sim ZIPoisson(p_i, \lambda_i)
+\\
+logit(p_i) = \alpha_p + \beta_p x_i
+\\
+log(\lambda_i) = \alpha_\lambda + \beta_\lambda x_i
+$$
+To show what we mean, lets start by simulating this process.
+```{r}
+# Assume monks will choose to drink 20% of days
+p_drink <- .2
+# Else they make 1 manuscript a day
+rate_work <- 1
+# Simulate for a year
+N <- 365
+
+df <- tibble(
+  drink = rbinom(N, 1, p_drink),
+  y = (1-drink) * rpois(N, rate_work)) %>% 
+  mutate(drink = ifelse(drink == 1, "yes", "no"),
+         Drink = factor(drink, c("yes", "no")))
+
+breaks <- seq(from = 0, to = 180, by = 20)
+
+ggplot(df, aes(y, fill = Drink)) +
+  geom_histogram(bins = 30) +
+  geom_hline(yintercept = breaks, colour = "white") +
+  scale_fill_manual(values = c("grey", "black")) +
+  scale_y_continuous(breaks = breaks) +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white")) +
+  annotate("text", label = "Simulated zero inflated \nbinomial process",
+           x = 3.5, y = 153) +
+  xlab("Manuscripts produced") + ylab("")
+```
+
+Now then, lets code this explicitly with the data and stan.
+```{r message=FALSE, warning=FALSE}
+b11.4 <- 
+  brm(data = df, family = zero_inflated_poisson,
+      y ~ 1,
+                # Rate of work
+      prior = c(prior(normal(1, .5), class = Intercept),
+                # Probability of drinking
+                prior(normal(-1.5, 1), class = zi)),
+      cores = 4, refresh = 0, sample_prior = "yes")
+
+hdi <- spread_draws(b11.4, b_Intercept, zi) %>% 
+  mutate(b_Intercept = exp(b_Intercept)) %>% 
+  gather_variables %>% 
+  median_hdi(.width = c(.5, .95))
+
+hdi %>% 
+  filter(.width == .95) %>% 
+  select(.value, .lower, .upper) %>% 
+  gather() %>% 
+  pull(value) %>% 
+  unique ->
+  breaks
+
+hdi %>% 
+  ggplot(aes(x = .value, y = .variable)) +
+    geom_vline(xintercept = hdi$.value,
+               linetype = 3, alpha = .7) +
+    tidybayes::geom_intervalh() +
+    theme(panel.grid = element_blank()) +
+    scale_x_continuous(breaks = breaks,
+                       labels = as.character(round(breaks, 2))) +
+    ylab("fixef") + xlab("Scaled 95% intervale") +
+    ggtitle("Marginal effects from a binomial process",
+            "We recovered our original estimates")
+```
+
+# Ordered categorical outcomes
+
+We can tackle these kinds of outcomes using a cumulative link function. By linking a linear model to cumulative probability, it is possible to guarantee the ordering of the outcomes.
+
+We will use some survey data as an example where there are is an ordered logit responses of cardinality 7. We describe it below in sample. 
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(rethinking))
+data(Trolley)
+df <- Trolley
+rm(Trolley)
+detach("package:rethinking")
+
+df_response <- df %>% 
+  group_by(response) %>% 
+  summarise(freq = n()) %>% 
+  mutate(cumulative_sum = cumsum(freq),
+         cumulative_proportion = cumulative_sum / sum(freq),
+         logistic_cumulative_proportion = logit_scaled(cumulative_proportion))
+
+print(df_response)
+
+p1 <- df_response %>% 
+  ggplot(aes(x=response, y = freq)) +
+    geom_histogram(stat="identity", width=.3) +
+    geom_hline(yintercept = seq(from=0, to=2500, by=250),
+               colour = "white") +
+    theme(panel.grid = element_blank(),
+          panel.background = element_rect(colour = "black", fill = "white")) +
+    xlab("Response") + ylab("frequency")
+
+p2 <- df_response %>% 
+  ggplot(aes(x = response, y = cumulative_proportion)) +
+    geom_line(colour = "black") +
+    geom_point(shape = 21, colour = "white", 
+               size = 3, stroke = 1.5, fill = "black") +  
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(colour = "black", fill = "white")) +
+  scale_x_continuous(breaks = 1:7) +
+  ylab("cumulative proportion") + xlab("Response")
+
+p3 <- df_response %>% 
+  ggplot(aes(x = response, y = logistic_cumulative_proportion)) +
+    geom_line(colour = "black") +
+    geom_point(shape = 21, colour = "white", 
+               size = 3, stroke = 1.5, fill = "black") +  
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(colour = "black", fill = "white")) +
+  scale_x_continuous(breaks = 1:7) +
+  coord_cartesian(ylim = c(-2, 2)) +
+  ylab("logistic cumulative proportion") + xlab("Response")
+
+gridExtra::grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+Lets now try to redescribe the logistic cumulative proportions as a series of intercepts in a stan model. We summarize this in the equation below. Each intercept will equal the log odds of being less than or equal to reponse $k$.
+
+$$
+\log \frac{Pr(y_i \leq k)}{1 - Pr(y_i \leq k)} = \alpha_k
+$$
+
+We need to be able to use this to compute the likelihood of each possible response value. We can do this by subtracting out the marginal cumulative proportions.
+$$
+p_k = Pr(y_i = k) = Pr(y_i \leq k) - Pr(y_i \leq k - 1)
+$$
+
+Now that we've uncovered it, lets let BRMS take care of it under the hood for us.
+```{r message=FALSE, warning=FALSE}
+b11.1 <- 
+  brm(data = df, family = cumulative,
+      response ~ 1,
+      prior(normal(0, 10), class = Intercept),
+      iter = 2000, warmup = 1000, cores = 2, chains = 2,
+      refresh = 0, sample_prior = "yes")
+summary(b11.1)
+```
+
+Notice that we regain the same estimates as before.
+```{r}
+tibble(
+  fit = c(fixef(b11.1) %>% 
+    inv_logit_scaled() %>% 
+    as_data_frame %>% 
+    pull(Estimate), 1),
+  sample = df_response$cumulative_proportion)
+```
+
+## Adding predictor variables
+To include predicor variables, we define the log-cumulative-odds of each response k as a sum of its intercept \alpha_k and a typical linear model. Suppose for example we want to add a predictor x to the model. We'll do this by defining a linear model $\phi_i = \beta x_i$
+
+$$
+log \frac{Pr(y_i \leq k)}{1 - Pr(y_i \leq k)} = \alpha_k - \phi_i
+\\
+\phi_i = \beta x_i
+$$
+
+We now add in a bunch of features, each of which we expect to have a negative impact on the the choice of response.
+
+```{r}
+b11.2 <- 
+  brm(data = df, family = cumulative,
+      response ~ 1 + action + intention + contact,
+      prior = c(prior(normal(0, 10), class = Intercept),
+                prior(normal(0, 10), class = b)),
+      iter = 2000, warmup = 1000, cores = 2, chains = 2)
+
+b11.3 <- 
+  update(b11.2,
+         formula = response ~ 1 + action + intention + contact + action:intention + contact:intention)
+
+loo(b11.1, b11.2, b11.3)
+```
+
+```{r}
+gather_draws(b11.3, `b_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  median_hdi() %>% 
+  ggplot(aes(x = .value, y = .variable)) +
+    geom_pointintervalh()
+```
+
+```{r}
+nd <- crossing(action = 0:1,
+               contact = 0:1,
+               intention = 0:1)
+
+fit <- fitted(b11.3,
+              newdata = nd)
+
+map_dfr(1:7, ~ bind_cols(as_tibble(fit[,,.x]), 
+                         ind = rep(.x, 8), 
+                         nd)) %>% 
+  ggplot(aes(y = Estimate, x = as.factor(ind), 
+             ymin = `Q2.5`, ymax = `Q97.5`)) +
+    geom_errorbar() + 
+    coord_flip() +
+    facet_grid(action + contact ~ intention,
+               labeller = label_both)
+```
+
+# Ordered categorical predictors
+
+We don't want to treat ordered categorical variables as continuous because we want to assume different distances between such a variable's values.
+```{r}
+education_levels <- c("Elementary School", "Middle School", "Some High School", "High School Graduate",
+                      "Some College", "Bachelor's Degree", "Master's Degree", "Graduate Degree")
+df$edu <- fct_relevel(df$edu, education_levels)
+df$edu %>% summary
+```
+
+We would like to encode this variable such that each step up in education comes with its own incremental effect on the outcome (or linear model). Below, we look to model the survey response against the respondents education levels. $K$ represents the individual cutpoints, or intercepts, for our outcome variable. $\beta_E$ represents the impact of maximum education. $E_i$ is the completed education level for individual $i$.
+
+$$
+response_i \sim OrderedLogit(\phi_i, K)
+\\
+\phi_i = \beta_E \sum_{j=0}^{E_i - 1} \delta_j + other\_stuff 
+\\
+...priors...
+\\\
+\delta \sim Dirichlet(\alpha)
+$$
+We let our $\delta$ parameters be _dirichlet_ distributed. The Dirichlet distribution is a generalization of the beta distribution that returns a vector of probabilities that sum to one. In the Dirichlet, the only parameter is a long vector with pseudo-counts for each possibility. Below, we show an example with $\alpha = rep(2, 7)$.
+
+```{r}
+library(gtools)
+set.seed(1805)
+as_tibble((rdirichlet( 10 , alpha=rep(2,7) ))) %>% 
+  mutate(idx = 1:10) %>% 
+  select(idx, everything()) %>% 
+  gather(draw, value, -idx) %>% 
+  ggplot(aes(x = idx, y = value, group = as.factor(draw))) +
+    geom_point() +
+    geom_line() +
+    geom_smooth(inherit.aes = FALSE,
+                aes(x = idx, y = value),
+                method = "lm")
+```
+
+# Homework
+
+## 11H1
+```{r}
+library(rethinking)
+data(Hurricanes)
+df <- as_data_frame(Hurricanes)
+rm(Hurricanes)
+detach("package:rethinking")
+df
+```
+
+```{r}
+fit.11h1.1 <- brm(deaths ~ 1,
+                data = df, family = poisson,
+                refresh = 0, cores = 4, chains = 2)
+
+fit.11h1.2 <- brm(deaths ~ 1 + femininity,
+                data = df, family = poisson,
+                refresh = 0, cores = 4, chains = 2)
+
+loo(fit.11h1.1, fit.11h1.2, reloo = TRUE)
+```
+
+It basically looks like there are some overly influential observations that are all female.
+```{r}
+fitted(fit.11h1.2, newdata = df) %>% 
+  as_data_frame %>% 
+  bind_cols(df) %>% 
+  slice(c(c(10, 29, 34, 59, 70, 88, 89, 92), sample(1:92, 8))) %>% 
+  mutate(row_num = row_number(),
+         problematic = as.factor(c(rep(1, 8), rep(0, 8))),
+         name = fct_reorder(name, abs(Estimate - deaths))) %>%   
+  ggplot(aes(x = name, y = Estimate, 
+             ymin = `Q2.5`, ymax = `Q97.5`,
+             color = problematic)) +
+    geom_pointrange() +
+    geom_point(aes(y = deaths), shape = 4, size = 2) +
+    coord_flip() +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor.x = element_blank())
+```
+
+Fit a gamma-Poisson (aka negative-binomial) model to predict deaths using femininity
+
+```{r}
+get_prior(deaths ~ 1 + femininity, data = df)
+```
+
+
+```{r}
+fit.11h2.1 <- brm(data = df, family = negbinomial,
+         deaths ~ 1 + femininity,
+         prior = c(prior(normal(0, .5), class = b)),
+         iter = 4000, warmup = 1000, cores = 2, chains = 2)
+plot(fit.11h2.1)
+```
+
+
+```{r}
+gather_draws(fit.11h2.1, b_femininity) %>% 
+  ggplot(aes(.value, .variable)) +
+    geom_vline(xintercept = 0, linetype = 2) +
+    geom_halfeyeh(.width = c(.5, .95)) +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Femininity is no longer significant")
+```
+
+```{r}
+loo(fit.11h2.1, fit.11h1.2, reloo = TRUE)
+```
+
+```{r}
+fit.11h3.1 <- brm(data = df, family = negbinomial,
+                  deaths ~ 1 + femininity + damage_norm,
+         prior = c(prior(normal(0, .5), class = b)),
+         iter = 4000, warmup = 1000, cores = 2, chains = 2)
+
+fit.11h3.2 <- brm(data = df, family = negbinomial,
+                  deaths ~ 1 + femininity + log(damage_norm),
+         prior = c(prior(normal(0, .5), class = b)),
+         iter = 4000, warmup = 1000, cores = 2, chains = 2)
+
+loo(fit.11h2.1, fit.11h3.1, fit.11h3.2)
+```
+
+For our best performing model, femininity is not very important.
+```{r}
+plot(fit.11h3.2)
+```
+
+
+```{r}
+gather_draws(fit.11h3.2, b_femininity) %>% 
+  median_hdci()
+```
+
+## 11H6
+```{r}
+library(tidyverse)
+library(brms)
+library(tidybayes)
+
+library(rethinking)
+data(Fish)
+df <- as_data_frame(Fish)
+rm(Fish)
+detach("package:rethinking")
+df
+```
+
+We want to model fish per person per hour so we'll add an explicity denominator for our rate
+```{r}
+df$log_person_hours <- log(df$persons * df$hours)
+```
+
+Now lets fit the data with that offset.
+```{r}
+fit.11h6.1 <- 
+  brm(data = df, family = zero_inflated_poisson,
+      bf(fish_caught ~ 1 + offset(log_person_hours) + livebait + child,
+         zi ~ 1 + child),
+      # Fishing rate
+      prior = c(prior(normal(1, .5), class = Intercept),
+      # Probability of drinking
+      prior(normal(0, 1), class = b)),
+      cores = 4, sample_prior = "yes")
+print(fit.11h6.1)
+```
+
+```{r}
+get_variables(fit.11h6.1)
+
+gather_draws(fit.11h6.1, `b_zi_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  median_hdi(.width = c(.5, .95)) %>% 
+  ggplot(aes(.value, .variable)) +
+    geom_intervalh()
+```
+
+```{r}
+gather_draws(fit.11h6.1, `b_[^z].*`, regex = TRUE) %>% 
+  mutate(.value = exp(.value)) %>% 
+  ggplot(aes(.value, .variable)) +
+    geom_halfeyeh(.width = c(.5, .95))
+```
+
+
+```{r}
+fixef(fit.11h6.1)
+```
+
+```{r}
+df_fitted <- df %>% 
+  mutate(
+    prob_no_fishing = inv_logit_scaled(-1.1661240 + (child * 0.4332892)))
+
+df_fitted <- bind_cols(
+  df_fitted,
+  estimate = as_data_frame(fitted(fit.11h6.1, nd = df_fitted))$Estimate)
+
+df_fitted %>% 
+  select(estimate, fish_caught)
+```
+
+```{r}
+l <- loo(fit.11h6.1,save_psis = TRUE, reloo = TRUE)
+l
+```
+
+

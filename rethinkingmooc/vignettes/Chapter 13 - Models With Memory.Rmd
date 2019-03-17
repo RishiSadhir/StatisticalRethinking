@@ -1,0 +1,496 @@
+  ---
+title: "Chapter 13 - Models without amnesia"
+output: html_notebook
+---
+
+# Multilevel models (AKA hierarchical / mixed effect / random effects models)
+
+There tend to be natural clusters within our data. A modeling strategy that can think across and within these clusters is beneficial.
+
+1. Improved estimates for repeated sampling (i.e., in longitudinal data).
+2. Improved estimates when there are imbalances among subsamples.
+3. Estimates of the variation across subsamples.
+4. Avoiding simplistic averaging by retaining variation across subsamples.
+
+# Example: Multilevel tadpoles
+
+Each row in this dataset is a tank, an experimental environment that contains tadpoles. Each tank likely has many unobservables associated with it. We have repeat measures and heterogeneity across clusters.
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(rethinking))
+data(reedfrogs)
+d <- reedfrogs %>% 
+  mutate(tank = 1:nrow(reedfrogs))
+rm(reedfrogs)
+detach(package:rethinking, unload = T)
+suppressPackageStartupMessages(library(brms))
+suppressPackageStartupMessages(library(tidybayes))
+str(d)
+```
+
+Lets start with how we would usually approach this, with each tank getting its own intercept. The model will have a unique log-odds for each tank.
+
+$$
+survival_i \sim Binomial(N_i, p_i)
+\\
+logit(p_i) = \alpha_{tank_i}
+\\
+\alpha_{tank} \sim Normal(0, 1.5)
+$$
+
+We run this in stan below.
+```{r fig.height=9, fig.width=11}
+b12.1 <- 
+  brm(data = d, family = binomial,
+      surv | trials(density) ~ 0 + factor(tank),
+      prior(normal(0, 1.5), class = b),
+      iter = 2000, warmup = 500, chains = 4, cores = 4,
+      sample_prior = "yes", refresh = 0)
+
+p1 <- gather_draws(b12.1, `b_.*`, regex = TRUE) %>% 
+  median_hdi(.width = c(.95, .5)) %>% 
+  ggplot(aes(y = .variable, x = .value)) +
+    geom_vline(xintercept = 0, linetype = 2) + 
+    tidybayes::geom_pointintervalh() +
+    theme_bw(base_family = "Courier") + theme(panel.grid.major.x = element_blank()) + 
+    xlab("95 and 50 percent median HDI") +
+    ylab("Tank number") +
+    ggtitle("Posterior Summary", "Survival probability for each tank")
+p2 <- gather_draws(b12.1, `prior.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  ggplot(aes(x = .value)) +
+    geom_density(fill = "black", colour = "transparent") +
+    theme_bw(base_family = "Courier") + 
+    theme(panel.grid = element_blank()) +
+    ggtitle("Prior distribution", "A flat prior was used on the inverse logit scale")
+
+lay <- rbind(c(1), c(1), c(2))
+gridExtra::grid.arrange(p1, p2, ncol = 1, layout_matrix = lay)
+```
+
+Now, we'll take a multilevel approach to adaptively pool informationa cross tanks. We do this by making the prior for each of our tank's survival probabilities be a function of other parameters.
+
+$$
+surv_i \sim Binomial(N_i, p_i)
+\\
+logit(p_i) = \alpha_{tank_i}
+\\
+\alpha_{tank} \sim Normal(\alpha, \sigma)
+\\
+\alpha \sim Normal(0, 1)
+\\
+\sigma \sim HalfCauchy(0, 1)
+$$
+
+This model specification provides posterior distributions for 50 parameters: one overall sample intercept $\alpha$ and it's standard deviation $\sigma$ and then the 48 intercepts per tank.
+
+```{r}
+b12.2 <- 
+  brm(data = d, family = binomial,
+      surv | trials(density) ~ 1 + (1 | tank),
+      prior = c(prior(normal(0, 1), class = Intercept),
+                prior(cauchy(0, 1), class = sd)),
+      iter = 4000, warmup = 1000, chains = 4, cores = 4,
+      refresh = 0)
+fixef(b12.2)
+```
+
+The adaptive priors improve our fit.
+```{r message=FALSE, warning=FALSE}
+kf <- kfold(b12.1, b12.2, 
+            save_fits = TRUE)
+kf
+```
+
+If we fit our model back to the original data, we notice three things as a result of our pooling.
+
+1. Each tank's survival proportion is regularized towards alpha, the group mean. This is known as _shrinkage_.
+2. Smaller tanks were shrunk more than the larger tanks. Smaller sample sizes shrink more.
+3. The farther a point is from the dashed line, the greater the distance between it and the corresponding multilevel estimate.
+
+```{r}
+global_mean <- spread_draws(b12.2, b_Intercept) %>%
+  transmute(b_Intercept = mean(inv_logit_scaled(b_Intercept)))
+
+fitted.b12.2 <- fitted(b12.2) %>% 
+  as_data_frame %>% 
+  transmute(surv_hat_2 = Estimate,
+            surv_low_2 = `Q2.5`,
+            surv_high_2 = `Q97.5`)
+
+fitted.b12.1 <- fitted(b12.1) %>% 
+  as_data_frame %>% 
+  transmute(surv_hat_1 = Estimate,
+            surv_low_1 = `Q2.5`,
+            surv_high_1 = `Q97.5`)
+
+bind_cols(select(d, tank, surv, density), 
+          fitted.b12.1, fitted.b12.2) %>%
+  bind_cols(select(d, tank, surv, density)) %>% 
+  ggplot(aes(x = tank)) +
+    stat_identity(yintercept=.78, geom='hline', inherit.aes=TRUE,
+                  linetype = 2, alpha = .7) +
+    geom_point(aes(y = surv/density), shape = 1, size = 2.5) +
+    geom_pointrange(aes(y = surv_hat_2/density, 
+                        ymin = surv_low_2/density, 
+                        ymax = surv_high_2/density),
+                    colour = "steelblue", size = .2,
+                    alpha = .7) +
+    theme(panel.grid = element_blank()) +
+    facet_wrap(~ factor(density), scales = "free_x", labeller = label_both)
+```
+
+```{r}
+# Draw 100 samples from the posterior
+post <- posterior_samples(b12.2, subset = 1:250) %>%
+  transmute(alpha = inv_logit_scaled(b_Intercept),
+            sigma = inv_logit_scaled(sd_tank__Intercept))
+
+# draw 1000 random numbers for each posterior sample
+map2_dfc(post$alpha, post$sigma, ~rnorm(1e3, .x, .y)) %>% 
+  gather %>% 
+  ggplot(aes(x = value, group = key)) +
+    geom_vline(xintercept = mean(post$alpha), 
+               linetype = 2, alpha = I(5/8)) +
+    geom_line(stat = "density", alpha = .075) +
+    xlab("Probability of survival") +
+    theme(panel.grid = element_blank(),
+          text = element_text(family = "Courier"))
+```
+
+# More than one type of cluster
+Often times, you'll want to use more than one type of cluster in the same model. Lets revist the chimpanzee dataset and try a few of these.
+
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+suppressPackageStartupMessages(library(recipes))
+data(chimpanzees)
+d <- as_data_frame(chimpanzees) %>% 
+  transmute(
+    pulled_left = pulled_left,
+    actor = as.factor(actor),
+    block = as.factor(block),
+    treatment = as.factor(as.integer(1 + prosoc_left + 2*condition)))
+rm(chimpanzees)
+detach("package:rethinking")
+d 
+```
+
+Lets compare a simple fixed effect model with varying effects models for actors, blocks, and treatments.
+```{r message=FALSE, warning=FALSE}
+b12.3.0 <- brm(
+  pulled_left ~ 0 + actor + block + treatment,
+  data = d, family = bernoulli,
+  prior = c(prior(normal(0, 1.5), class = b)),
+  sample_prior = "yes", refresh = 0)
+
+b12.3.1 <- brm(
+  pulled_left ~ 1 + (1 | actor) + (1 | block) + (1 | treatment),
+  data = d, family = bernoulli,
+  prior = c(prior(normal(0, 1.5), class = Intercept),
+            prior(student_t(3, 0, 10), class = sd)),
+  sample_prior = "yes", refresh = 0)
+
+print("The models perform almost the same")
+l.b12.3.0 <- loo(b12.3.0)
+l.b12.3.1 <- loo(b12.3.1)
+compare_ic(l.b12.3.0, l.b12.3.1)
+```
+
+Interestingly, the number of effective parameters is less for the more complex hierarchical model. This is a result of blocking being regularized out.
+```{r}
+list(
+  l.b12.3.0 = l.b12.3.0$estimates,
+  l.b12.3.1 = l.b12.3.1$estimates)
+```
+
+We can see this explicitly by examining the coefficients on the outcome scale. Blocking variables are indistinguishable from zero after regualization.
+
+```{r fig.height=4, fig.width=3}
+p_tp <- gather_draws(b12.3.0, `b_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  ggplot(aes(y = .variable, x = .value)) +
+    geom_vline(xintercept = .5, linetype = 2) +
+    geom_halfeyeh(.width = c(.5, .95), point_interval = median_hdi) +
+    theme_tidybayes() +
+    theme(panel.grid.major.y = element_line(linetype = 2, 
+                                            colour = "lightgrey"),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          panel.background = element_rect(fill = "white", colour = "black")) +
+    ggtitle("Zero pooling model")
+
+p_pp <- b12.3.1 %>%
+  gather_draws(`r_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  ggplot(aes(y = .variable, x = .value)) +
+    geom_vline(xintercept = .5, linetype = 2, alpha = .3) +
+    geom_halfeyeh(.width = c(.5, .95), point_interval = median_hdi) +
+    coord_cartesian(xlim = c(0, 1)) +
+    theme(panel.grid.major.y = element_line(linetype = 2, colour = "lightgrey"),
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.x = element_blank(),
+          panel.background = element_rect(fill = "white", colour = "black")) +
+    ggtitle("Partial pooling model", "Blocks don't appear to have added anything")
+
+gridExtra::grid.arrange(p_tp, p_pp)
+```
+
+If we compare sigma_a to sigma_g we notice that the estimated variation among actors is a lot larger than the estimated variation among blocks. Lets show this by plotting the marginal posterior distributions of these two parameters.
+```{r}
+b12.3.1 %>% 
+  gather_draws(`sd_.*`, regex = TRUE) %>% 
+  ggplot(aes(x = .value, y = .variable)) +
+    geom_vline(xintercept = 0, linetype = 2 ) +
+    geom_halfeyeh() +
+    ggtitle(expression(sigma),
+            "There is very little estimated variation across blocks") +
+    theme(panel.grid = element_blank()) +
+    scale_x_continuous(breaks = seq(from = 0, to = 10, by = 2)) +
+    coord_cartesian(xlim = c(0, 10))
+```
+
+# Divergent transitions and non-centered priors
+Divergent transitions are indicative of not fully exploring the posterior space which could lead to biased estimates. Here we'll examine tricks to help with this.
+
+## Adjust target acceptance
+We can increase the `adapt delta` control parameter to make each step size smaller. This requires a lot more computation and isn't always enough.
+
+## Reparameterization
+Non-centered parameterization, an unfortunately mischaracterizing name, pulls the mean of a prior out and adds it as a constant plus a 0 mean and positive variance term.
+
+We can turn this: $\alpha \sim Normal(\mu, \sigma)$ in to this:
+
+$$
+\alpha = mu + z\sigma
+\\
+z \sim Normal(0, 1)
+$$
+The z parameter has a standard normal distribution. Multiplying it by $\sigma$ scales it correctly, and then adding $\mu$ gives it the right mean.
+
+Lets utilize this reparameterization in the chimpanzee model.
+$$
+L_i \sim Binomial(1, p_i)
+\\
+logit(p_i) = \bar{\alpha} + z_{actor[i]}\sigma_{\alpha} + 
+  \chi_{block[i]} \sigma_{\gamma} + \beta_{treatment[i]}
+\\
+\beta_j \sim Normal(0, .5)\ for\ j=1...4
+\\
+z_j \sim Normal(0, 1)\ for\ j=1...7
+\\
+\chi_j \sim Normal(0, 1)\ for\ j=1...6
+\\
+\bar{\alpha} \sim Normal(0, 1.5)
+\\
+\sigma_\alpha \sim Exponential(1)
+\\
+\sigma_\gamma \sim Exponential(1)
+$$
+
+# Multilevel posterior predictions
+Producing implied predictions from a fit model, is very helpful for understanding what the model means. The introduction of varying effects does introduce nuance. First, we should no longer expect the model to exactly retrodict the sample because adaptive regularization will have sacrificed some of that fit for better out of sample performance. 
+
+Second, “prediction” in the context of a multilevel model requires additional choices. If we wish to validate a model against the specific clusters used to fit the model, that is one thing. But if we instead wish to compute predictions for new clusters, other than the one observed in the sample, that is quite another.
+
+## Same cluster prediction
+
+We can use fitted to generate these.
+```{r}
+nd <- tibble(
+  prosoc_left = c(0, 1, 0, 1),
+  condition   = c(0, 0, 1, 1),
+  actor       = 2) %>% 
+  mutate(
+    treatment = as.factor(as.integer(1 + prosoc_left + 2*condition))) %>% 
+  select(-prosoc_left)
+nd
+```
+```{r}
+nd <- crossing(
+  actor = factor(2),
+  block = factor(1:6),
+  treatment = factor(1:4))
+
+df <- bind_cols(nd,
+          as_data_frame(fitted(b12.3.1, 
+                               newdata = nd)))
+
+ggplot(df, aes(x = treatment, y = Estimate, colour = block)) +
+    geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) +
+    geom_line()
+```
+
+Alternatively, we could use the `re_formula = NA` argument to ignore group effects in the fitting.
+```{r}
+nd <- crossing(
+  actor = factor(2),
+  block = factor(1:6),
+  treatment = factor(1:4))
+
+df <- bind_cols(nd,
+          as_data_frame(fitted(b12.3.1, 
+                               newdata = nd,
+                               re_formula = NA)))
+
+ggplot(df, aes(x = treatment, y = Estimate, colour = block)) +
+    geom_pointrange(aes(ymin = Q2.5, ymax = Q97.5)) +
+    geom_line()
+```
+
+
+# Homework
+
+This data comes from a 1988 Bangladesh Fertility Survey. Each row is a woman.
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(bangladesh)
+d <- bangladesh %>% 
+  as_data_frame()
+rm(bangladesh)
+detach("package:rethinking")
+num2fact <- compose(as.factor, as.character)
+d <- d %>% 
+  transmute(woman = num2fact(woman),
+            district = num2fact(district),
+            contraception = as.integer(use.contraception),
+            children = living.children,
+            age_centered = age.centered,
+            urban = num2fact(urban))
+d %>% 
+  glimpse
+```
+
+Lets start by using district to predict contraception. Comparing the zero pooling model with the partial pooling model shows us that pooling is barely better.
+```{r message=FALSE, warning=FALSE}
+b.12.h1.fe <- brm(contraception ~ 0 + district,
+                  data = d, family = bernoulli,
+                  prior = prior(normal(0, 1), class = b),
+                  cores = 4, sample_prior = "yes",
+                  refresh = 0)
+
+b.12.h1.vi <- brm(contraception ~ 1 + (1 | district),
+                  data = d, family = bernoulli,
+                  prior = c(prior(normal(0, 1), class = Intercept),
+                            prior(gamma(2, .1), class = sd)),
+                  cores = 4, sample_prior = "yes",
+                  refresh = 0)
+loo(b.12.h1.fe, b.12.h1.vi)
+```
+
+```{r}
+nd <- data_frame(
+  district = unique(b.12.h1.vi$data$district))
+
+fitted.12.h1.vi <- bind_cols(district = as.integer(as.character(nd$district)),
+                             as_data_frame(fitted(b.12.h1.vi, newdata = nd)),
+                             model = rep("Partial pooling", nrow(nd)))
+fitted.12.h1.fe <- bind_cols(district = as.integer(as.character(nd$district)),
+                             as_data_frame(fitted(b.12.h1.fe, newdata = nd)),
+                             model = rep("No pooling", nrow(nd)))
+
+reg <- fixef(b.12.h1.vi) %>% 
+  inv_logit_scaled() %>% 
+  as_data_frame() %>% 
+  pull(Estimate)
+
+bind_cols(fitted.12.h1.vi %>% 
+            transmute(
+              district,
+              estimate_pp = Estimate,
+              estimate_pp_low = Q2.5,
+              estimate_pp_high = Q97.5),
+          fitted.12.h1.fe %>% 
+            transmute(
+              district,
+              estimate_fe = Estimate,
+              estimate_fe_low = Q2.5,
+              estimate_fe_high = Q97.5)) %>% 
+  ggplot(aes(x = district, xend = district)) +
+    geom_hline(yintercept = 0.3686518, linetype = 2, alpha = .8, colour = "firebrick") +
+    geom_segment(aes(y = estimate_pp, yend = estimate_fe), colour = "steelblue") +
+    geom_point(aes(y = estimate_pp), colour = "firebrick", size = 2) +
+    #geom_point(aes(y = estimate_fe), colour = "steelblue") +
+    theme(panel.grid = element_blank(),
+          panel.background = element_rect(fill = "white", colour = "black"),
+          text = element_text(family = "Courier")) +
+    xlab("District ID") + ylab("Probability of contraception usage") +
+    ggtitle("The effects of partial pooling across districts") +
+    scale_x_continuous(breaks = seq(from = 0, to = 65, by = 5))
+
+```
+
+
+## 12h2
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(Trolley)
+d <- as_data_frame(Trolley) %>% 
+  select(id, action, intention, contact, response)
+detach("package:rethinking")
+rm(Trolley)
+d %>% 
+  skimr::skim()
+```
+
+
+```{r}
+b.12h2.1 <- brm(response ~ 1 + action + contact + intention,
+    data  = d, family = cumulative,
+    prior = c(prior(normal(0, 1), class = b),
+              prior(normal(0, 1), class = Intercept)),
+    sample_prior = "yes")
+
+print(b.12h2.1)
+```
+
+```{r}
+b.12h2.2 <- brm(response ~ 1 + action + contact + intention + (1 | id),
+    data  = d, family = cumulative,
+    prior = c(prior(normal(0, 1), class = b),
+              prior(normal(0, 1), class = Intercept)),
+    sample_prior = "yes")
+
+print(b.12h2.2)
+```
+
+```{r}
+loo(b.12h2.1, b.12h2.2)
+```
+
+```{r}
+draws.12h2.2 <- gather_draws(b.12h2.2, `b_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  median_hdi() %>% 
+  mutate(Model = "partial pooling")
+
+draws.12h2.1 <- gather_draws(b.12h2.1, `b_.*`, regex = TRUE) %>% 
+  mutate(.value = inv_logit_scaled(.value)) %>% 
+  median_hdi() %>% 
+  mutate(Model = "total pooling")
+
+bind_rows(draws.12h2.2, draws.12h2.1) %>% 
+  ggplot(aes(x = .variable, y = .value, colour = Model)) +
+  geom_hline(yintercept = .5, linetype = 2, alpha = .3) +
+  geom_pointrange(aes(ymin = .lower, ymax = .upper), 
+                  position=position_dodge(width=0.5),
+                  size = .2) +
+  theme(panel.grid.major.y = element_line(linetype = 1, colour = "grey92"),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.background = element_blank(),
+        axis.ticks = element_blank(),
+        legend.key = element_rect(fill = "transparent")) +
+  coord_flip() +
+  scale_colour_manual(values = c("firebrick", "steelblue")) +
+  ylab("Probability scaled coefficient") +
+  xlab("Variable") +
+  ggtitle("Model comparison",
+          "Partial pooling showed a looic improvement of 5749.23")
+
+```
+
+
+
+
+

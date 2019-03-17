@@ -1,0 +1,475 @@
+---
+title: "Chapter 14 - Adventures in Covariance"
+output: html_notebook
+---
+
+```{r setup}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(brms))
+suppressPackageStartupMessages(library(tidybayes))
+
+options(mc.cores = parallel::detectCores())
+```
+
+# Varying slopes by construction
+
+In the same way that pooling is helpful for intercepts, it is also helpful for slopes. Any batch of parameters with exchangeable index values (index values have no true ordering because they are arbitrary) can and should be pooled.
+
+$$
+Q \sim Binomial(p, D)
+\\
+p = \alpha_{sku[i]} + \beta_{sku[i]}Z_i
+$$
+
+Clustering can affect many parameters at once! A sku's class affects both its base line sale rate ($\alpha_{sku[i]}$) and its marginal flagged sale rate ($\beta_{sku[i]}$).
+
+Clusters affect both intercepts and slopes. We account for this by modeling the joint population of intercepts and slopes by modeling their covariance through multivariate gaussian distributions.
+
+Simulated example - Cafes are busy in the morning but maybe not the afternoon. We'll define a covariance matrix between a cafe's intercept and slope.
+```{r}
+a       <-  3.5  # average morning wait time
+b       <- -1    # average difference afternoon wait time
+sigma_a <-  1    # std dev in intercepts
+sigma_b <-  0.5  # std dev in slopes
+rho     <- -.7   # correlation between intercepts and slopes
+
+# The next three lines of code simply combine the terms, above
+mu <- c(a, b)
+
+cov_ab <- sigma_a * sigma_b * rho
+sigma  <- matrix(c(sigma_a^2, cov_ab, 
+                   cov_ab, sigma_b^2), ncol = 2)
+
+```
+
+We can also get there via matrix multiplication. This way is conceptually more useful when it comes time to specify priors because it lets you define standard deviations and correlations seperately.
+
+```{r}
+# Standard deviations
+sigmas <- c(sigma_a, sigma_b)
+# Correlations
+Rho    <- matrix(c(1, rho, rho, 1), nrow = 2)
+# Matrix multiply to get vcov matrix
+sigma  <- diag(sigmas) %*% Rho %*% diag(sigmas)
+
+set.seed(5)
+n_cafes <- 200
+vary_effects <- 
+  # Feed in means and covariances
+  # in to a multivariate gaussian rng
+  MASS::mvrnorm(n_cafes, mu, sigma)
+
+vary_effects <-
+  vary_effects %>% 
+  as_tibble() %>% 
+  rename(a_cafe = V1,
+         b_cafe = V2)
+
+str(vary_effects)
+```
+
+```{r}
+vary_effects %>% 
+  ggplot(aes(x = a_cafe, y = b_cafe)) +
+  geom_smooth(method = lm, colour = "steelblue") +
+  geom_point(color = "steelblue") +
+  geom_rug(alpha = I(1/6)) +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "transparent", colour = "black")) +
+  ggtitle("Distribution of parameters")
+```
+
+Lets use this covariance relationship to simulate wait time ovservations at two cafes.
+```{r}
+n_visits <- 10
+sigma    <-  0.5  # std dev within cafes
+set.seed(5)  # used to replicate example
+
+d <- vary_effects %>%
+  # Create cafe index
+  mutate(cafe      = 1:n_cafes) %>% 
+  # n_visits for each one
+  expand(nesting(cafe, a_cafe, b_cafe), visit = 1:n_visits) %>% 
+  # Split them between morning and afternoon
+  mutate(afternoon = rep(0:1, times = n() / 2)) %>% 
+  # Calculate the mean
+  mutate(mu        = a_cafe + b_cafe * afternoon) %>% 
+  # Simulat the wait time
+  mutate(wait      = rnorm(n = n(), mean = mu, sd = sigma))
+
+d %>%
+  mutate(afternoon = ifelse(afternoon == 0, "M", "A"),
+         day       = rep(rep(1:5, each = 2), times = n_cafes)) %>%
+  filter(cafe %in% c(3, 5)) %>%
+  mutate(cafe = ifelse(cafe == 3, "cafe #3", "cafe #5")) %>%
+  
+  ggplot(aes(x = visit, y = wait, group = day)) +
+  geom_line(color = "#8B9DAF") +
+  geom_point(aes(color = afternoon), size = 3) +
+  scale_color_manual(values = c("#80A0C7", "#EEDA9D")) +
+  scale_x_continuous(breaks = 1:10,
+                     labels = rep(c("M", "A"), times = 5)) +
+  coord_cartesian(ylim = 0:8) +
+  labs(x = NULL, y = "wait time in minutes") +
+  theme(legend.position = "none",
+        axis.ticks.x    = element_blank(),
+        panel.grid      = element_blank()) +
+  facet_wrap(~cafe, ncol = 1)
+```
+
+Now lets recreate our parameters from our simulated data with the following model. In line 3, we specify that the slope and intercept covary through a joint multivariate guassian distribution. In line 4 we specify the covariance structure.
+
+$$
+W_i \sim Normal(\mu_i, \sigma)
+\\
+\mu_i = \alpha_{cafe[i]} + \beta_{cafe[i]}A_i
+\\
+\begin{bmatrix} \alpha_{cafe} \\ \beta_{cafe} \\ \end{bmatrix} \sim MVNormal(\begin{bmatrix} \alpha \\ \beta \end{bmatrix}, S)
+\\
+S = \begin{bmatrix} \sigma_\alpha & 0 \\ 0 & \sigma_\beta\end{bmatrix} \ R \ \begin{bmatrix} \sigma_\alpha & 0 \\ 0 & \sigma_\beta\end{bmatrix}
+\\
+\alpha \sim Normal(5, 2)
+\\
+\beta \sim Normal(-1, .5)
+\\
+\sigma \sim Exponential(1)
+\\
+\sigma_{\alpha} \sim Exponential(1)
+\\
+\sigma_{\beta} \sim Exponential(1)
+\\
+R \sim LKJcorr(2)
+$$
+
+The final line of the model defines the prior for our covariances. Right now, we only have one slope and one intercept that covary: $ R = \begin{bmatrix} 1 & \rho \\ \rho & 1 \end{bmatrix}$. So we'd really only need to define a prior for $\rho$. When there is more than that, its useful to use the _LKJcorr distribution_.
+
+> You can think of it as a regularizing prior for correlations. This distribution has a single parameter, η, that controls how skeptical the prior is of large correlations in the matrix. When we use LKJcorr(1), the prior is flat over all valid correlation matrices. When the value is greater than 1, such as the 2 we used above, then extreme correlations are less likely. 
+
+```{r}
+n_sim <- 1e5
+set.seed(133)
+etas <- c(1, 2, 4)
+
+etas %>% 
+  map_dfc(~ rethinking::rlkjcorr(n_sim, K = 2, eta = .x)[,1,2]) %>% 
+  set_names(as.character(etas)) %>% 
+  gather(Eta, draw) %>% 
+  ggplot(aes(x = draw, fill = Eta)) +
+    geom_density(colour = "transparent", alpha = I(1/3)) +
+    theme(panel.grid = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank()) +
+    xlab("Correlation") + ylab("Density") +
+    ggtitle("lkjCorr distribution",
+            "Higher etas specify more skepticism of covariance") +
+    scale_x_continuous(breaks = c(-1, 1)) +
+    scale_fill_manual(values = c("steelblue", "firebrick", "yellow"))
+```
+
+With that distribution in our arsenal, lets get modeling! In our regression formula, we specify that both the intercept and time-of-day covary with cafes. 
+
+```{r}
+get_prior(data = d, family = gaussian,
+      wait ~ 1 + afternoon + (1 + afternoon | cafe))
+```
+
+
+```{r}
+ b13.1 <- 
+  brm(data = d, family = gaussian,
+      wait ~ 1 + afternoon + (1 + afternoon | cafe),
+      prior = c(prior(normal(0, 10), class = Intercept),
+                prior(normal(0, 10), class = b),
+                prior(cauchy(0, 2) , class = sd),
+                prior(cauchy(0, 2) , class = sigma),
+                prior(lkj(2), class = cor)),
+      sample_prior = "yes", refresh = 0,
+      iter = 5000, warmup = 2000, chains = 2, cores = 2)
+summary(b13.1)
+```
+
+Lets examine the learned correlation between our slopes and intercepts
+```{r}
+post <- posterior_samples(b13.1)
+
+post %>%
+  ggplot(aes(x = cor_cafe__Intercept__afternoon)) +
+  geom_density(aes(x = prior_cor_cafe),
+               color = "transparent", fill = "#EEDA9D", alpha = 3/4) +
+  geom_density(color = "transparent", fill = "#A65141", alpha = 9/10) +
+  annotate("text", label = "posterior", 
+           x = -0.2, y = 2.2, 
+           color = "#A65141", family = "Courier") +
+  annotate("text", label = "prior", 
+           x = 0, y = 0.85, 
+           color = "#EEDA9D", alpha = 2/3, family = "Courier") +
+  scale_y_continuous(NULL, breaks = NULL) +
+  scale_x_continuous(breaks = c(-1, 0, 1)) +
+  xlab("correlation")
+```
+
+```{r}
+# Extract group level coefficients like so:
+# coefficients$groupterm[allrows,estimates_only,parameters 1 and 2]
+partially_pooled_estimates <-
+  coef(b13.1)$cafe[ , 1, 1:2] %>%
+  as_tibble() %>%
+  rename(morning   = Intercept) %>% 
+  mutate(afternoon = morning + afternoon,
+         cafe      = 1:n()) %>%
+  select(cafe, everything()) 
+
+# Compute unpooled estimates directly from data
+un_pooled_estimates <-
+  d %>%
+  group_by(afternoon, cafe) %>% 
+  summarise(mean = mean(wait)) %>%
+  ungroup() %>%
+  mutate(afternoon = ifelse(afternoon == 0, "morning", "afternoon")) %>%
+  spread(key = afternoon, value = mean)
+
+estimates <-
+  bind_rows(partially_pooled_estimates, un_pooled_estimates) %>%
+  mutate(pooled = rep(c("partially", "not"), each = n() / 2))
+  
+ggplot(data = estimates, aes(x = morning, y = afternoon)) +
+  # Nesting `stat_ellipse()` within `mapply()` is a less redundant way to produce the 
+  # ten-layered semitransparent ellipses we did with ten lines of `stat_ellipse()` 
+  # functions in the previous plot
+  mapply(function(level) {
+    stat_ellipse(geom  = "polygon", type = "norm",
+                 size  = 0, alpha = 1/15,
+                 level = level)
+    }, 
+    # Enter the levels here
+    level = c(seq(from = 1/10, to = 9/10, by = 1/10), .99)) +
+  geom_line(aes(group = cafe), size = 1/4) +
+  geom_point(aes(group = cafe, color = pooled)) +
+  scale_color_manual("Pooled?",
+                     values = c("steelblue", "firebrick")) +
+  coord_cartesian(xlim = range(estimates$morning),
+                  ylim = range(estimates$afternoon)) +
+  theme(panel.background = element_rect(fill = "transparent", color = "black"),
+        panel.grid = element_blank(),
+        legend.position = c(0, 1),
+        legend.justification = c(0, 1),
+        legend.background = element_blank()) +
+  labs(x = "morning wait (mins)",
+       y = "afternoon wait (mins)")
+```
+
+# Example: Admission decisions and gender
+
+Let’s revisit the infamous UCB admissions data.
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(UCBadmit)
+d <- UCBadmit
+detach(package:rethinking, unload = T)
+library(brms)
+rm(UCBadmit)
+
+d <- 
+  d %>%
+  mutate(male    = ifelse(applicant.gender == "male", 1, 0),
+         dept_id = rep(1:6, each = 2)) %>% 
+  select(admit, applications, dept_id, male)
+
+d %>% glimpse()
+```
+
+We'll model the probability of admission with partial pooling among departments.
+$$
+admit_i \sim Binomial(n_i, p_i)
+\\
+logit(p_i) = \alpha_{dept[i]} + \beta * male_i
+\\
+\alpha_{dept} \sim Normal(\alpha, \sigma)
+\\
+\alpha \sim Normal(0, 10)
+\\
+\beta \sim Normal(0, 1)
+\\
+\sigma \sim HalfCauchy(0, 2)
+$$
+
+Lets fit this with stan and BRMS
+```{r}
+b13.2 <-
+  brm(data = d, family = binomial,
+      admit | trials(applications) ~ 1 + male + (1 | dept_id),
+      prior = c(prior(normal(0, 1.5), class = Intercept),
+                prior(normal(0, 1.5), class = b),
+                prior(cauchy(0, 2), class = sd)),
+      refresh = 0, chains = 4, cores = 4,
+      control = list(adapt_delta = .99))
+
+summary(b13.2)
+```
+
+
+```{r}
+post <- posterior_samples(b13.2) post$b_Intercept
+
+post %>% 
+  transmute(diff = inv_logit_scaled(b_Intercept + b_male) - inv_logit_scaled(b_Intercept)) %>% 
+  gather() %>% 
+  ggplot(aes(x = value, y = key)) +
+    geom_halfeyeh() +
+    ggtitle("This model implies negligble effect of being male")
+```
+
+To confirm, lets also vary the marginal effect of being male by department.
+
+$$
+admit_i \sim Binomial(n_i , p_i)
+\\
+logit(p_i) = \alpha_{deptid} + \beta_{deptid}male_i
+\\
+\begin{bmatrix} \alpha_{deptid} \\ \beta_{deptid} \end{bmatrix} \sim MVNormal(\begin{bmatrix} \alpha \\ \beta \end{bmatrix}, \textbf{S})
+\\
+S = \begin{bmatrix} \sigma_{\alpha} & 0 \\ 0 & \sigma_{\alpha} \end{bmatrix} \textbf{R} \begin{bmatrix} \sigma_{\alpha} & 0 \\ 0 & \sigma_{\alpha} \end{bmatrix}
+\\
+\alpha \sim Normal(0, 1.5)
+\\
+\beta \sim Normal(0, 1)
+\\
+(\sigma_{\alpha}, \sigma_{\beta}) \sim HalfCauchy(0, 2)
+\\
+\textbf{R} \sim LKJcorr(2)
+$$
+
+Lets fit this in STAN
+```{r}
+b13.3 <- 
+  brm(data = d, family = binomial,
+      admit | trials(applications) ~ 1 + male + (1 + male | dept_id),
+      prior = c(prior(normal(0, 1.5), class = Intercept),
+                prior(normal(0, 1), class = b),
+                prior(cauchy(0, 2), class = sd),
+                prior(lkj(2), class = cor)),
+      chains = 4, cores = 4, refresh = 0)
+summary(b13.3)
+```
+
+What we find below is that department intercepts are far more dispersed than gender. Being male's marginal effect is largely negligable.
+
+```{r}
+post <- posterior_samples(b13.3)
+post %>% 
+  select(starts_with("r_")) %>% 
+  gather() %>% 
+  mutate(value = inv_logit_scaled(
+    value + post$b_Intercept)) %>% 
+  group_by(key) %>% 
+  median_hdi(.width = c(.5, .95)) %>% 
+  mutate(sort_idx = ifelse(str_detect(key, ".*Intercept.*"), 0, 1)) %>% 
+  ggplot(aes(y = fct_reorder(key, sort_idx), x = value)) +
+    geom_vline(xintercept = .5, linetype = 2, alpha = I(1/3)) +
+    geom_pointintervalh() +
+    theme(panel.grid       = element_blank(),
+          panel.background = element_rect(fill = "transparent", colour = "black"),
+          text             = element_text(family="Courier")) +
+    xlab("Probability scaled marginal posterior distributions") + ylab("") +
+    ggtitle("Gender is not a big influence on admission rates",
+            "Shown with 50% and 95% credible intervals about the median")
+
+```
+
+# Example: Chimps again!
+
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(chimpanzees)
+d <- chimpanzees
+detach(package:rethinking, unload = T)
+library(brms)
+rm(chimpanzees)
+
+d <-
+  d %>%
+  select(-recipient) %>%
+  mutate(block_id = block)
+d
+```
+
+Lets bring back an old version of this model to reaquint ourselves.
+
+$$
+pulled\_left_i \sim bernoulli(p_i)
+\\
+logit(p_i) = \alpha_i + (\beta_1 + \beta_2 condition_i)prosoc\_left_i
+\\
+\alpha_i = \alpha + \alpha_{block[i]} + \alpha_{actor[i]}
+\\
+\alpha_{actor} \sim Normal(0, \sigma_{actor})
+\\
+\alpha_{block} \sim Normal(0, \sigma_{block})
+\\
+\beta_1, \beta_2 \sim Normal(0, 10)
+\\
+\sigma_{actor}, \sigma_{block} \sim HalfCauchy(0, 1)
+$$
+
+In stan:
+
+```{r}
+b12.5 <- 
+  brm(data = d, family = bernoulli,
+      pulled_left ~ 1 + prosoc_left + condition:prosoc_left + 
+        (1 | actor) + (1 | block_id),
+      refresh = 0,
+      prior = c(prior(normal(0, 10), class = Intercept),
+                prior(normal(0, 10), class = b),
+                prior(cauchy(0, 1), class = sd)),
+      iter = 5000, warmup = 1000, chains = 3, cores = 3)
+summary(b12.5)
+```
+
+We want to understand how the treatment effect varies by block and actor. We do this by expanding each term to include a grand mean and a deviation for each individual block and each individual actor. Additionally, terms that are varying together within the same cluster have a specified covariance matrix.
+
+$$
+\begin{eqnarray}
+\text{pulled_left}_i & \sim & \text{Binomial} (n = 1, p_i) \\
+\text{logit} (p_i) & = & \alpha_i + (\beta_{1i} + \beta_{2i} \text{condition}_i) \text{prosoc_left}_i  \\
+\alpha_i & = & \alpha + \alpha_{\text{actor}_i} + \alpha_{\text{block_id}_i} \\
+\beta_{1i} & = & \beta_1 + \beta_{1, \text{actor}_i} + \beta_{1, \text{block_id}_i} \\
+\beta_{2i} & = & \beta_2 + \beta_{2, \text{actor}_i} + \beta_{2, \text{block_id}_i} \\
+\begin{bmatrix} \alpha_\text{actor} \\ \beta_{1, \text{actor}} \\ \beta_{2, \text{actor}} \end{bmatrix} & \sim & \text{MVNormal} \begin{pmatrix} \begin{bmatrix}0 \\ 0 \\ 0 \end{bmatrix} , \mathbf{S}_\text{actor} \end{pmatrix} \\
+\begin{bmatrix} \alpha_\text{block_id} \\ \beta_{1, \text{block_id}} \\ \beta_{2, \text{block_id}} \end{bmatrix} & \sim & \text{MVNormal} \begin{pmatrix} \begin{bmatrix}0 \\ 0 \\ 0 \end{bmatrix} , \mathbf{S}_\text{block_id} \end{pmatrix} \\
+\mathbf S_\text{actor} & = & \begin{pmatrix} \sigma_{\alpha_\text{actor}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{actor}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{actor}}} \end{pmatrix} 
+\mathbf R_\text{actor} \begin{pmatrix} \sigma_{\alpha_\text{actor}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{actor}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{actor}}} \end{pmatrix} \\
+\mathbf S_\text{block_id} & = & \begin{pmatrix} \sigma_{\alpha_\text{block_id}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{block_id}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{block_id}}} \end{pmatrix} 
+\mathbf R_\text{block_id} \begin{pmatrix} \sigma_{\alpha_\text{block_id}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{block_id}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{block_id}}} \end{pmatrix} \\
+(\sigma_{\alpha_\text{actor}}, \sigma_{\beta_{1_\text{actor}}}, \sigma_{\beta_{2_\text{actor}}}) & \sim & \text{HalfCauchy} (0, 2) \\
+(\sigma_{\alpha_\text{block_id}}, \sigma_{\beta_{1_\text{block_id}}}, \sigma_{\beta_{2_\text{block_id}}}) & \sim & \text{HalfCauchy} (0, 2) \\
+\mathbf R_\text{actor} & \sim & \text{LKJcorr} (4) \\
+\mathbf R_\text{block_id} & \sim & \text{LKJcorr} (4)
+\end{eqnarray}
+$$
+
+The parameterization above is that of the centered form. In multilevel modeling, the centered form tends to have a more ergodic geometry. BRMS does this conversion on its own behind the scenes.
+
+```{r}
+b13.6 <- 
+  brm(data = d, family = bernoulli,
+      pulled_left ~ 1 + prosoc_left + condition:prosoc_left +
+        (1 + prosoc_left + condition:prosoc_left | actor) +
+        (1 + prosoc_left + condition:prosoc_left | block_id),
+      prior = c(prior(normal(0, 1), class = Intercept),
+                prior(normal(0, 1), class = b),
+                prior(cauchy(0, 2), class = sd),
+                prior(lkj(4), class = cor)),
+      refresh = 0, control = list(adapt_delta = .95),
+      iter = 5000, warmup = 1000, chains = 3, cores = 3)
+summary(b13.6)
+```
+
+
+```{r}
+loo(b13.6, b12.5)
+```
+
+> Our interpretation of this experiment has not changed. These chimpanzees simply did not behave in any consistently different way in the partner treatments. The model we’ve used here does have some advantages, though. Since it allows for some individuals to differ in how they respond to the treatments, it could reveal a situation in which a treatment has no effect on average, even though some of the individuals respond strongly. That wasn’t the case here. But often we are more interested in the distribution of responses that the average response, so a model that estimates the distribution of treatment effects is very useful.
+
+
