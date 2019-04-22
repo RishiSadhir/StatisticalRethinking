@@ -378,98 +378,160 @@ post %>%
 
 # Example: Chimps again!
 
-```{r}
+Lets revisit the chimps data set again to show off a model with multiple clusters
+```{r data load}
 suppressPackageStartupMessages(library(rethinking))
 data(chimpanzees)
 d <- chimpanzees
-detach(package:rethinking, unload = T)
-library(brms)
-rm(chimpanzees)
-
-d <-
-  d %>%
-  select(-recipient) %>%
-  mutate(block_id = block)
-d
+detach("package:rethinking")
+d <- d %>% 
+  mutate(
+    treatment = 1 + prosoc_left + 2*condition,
+    treatment = as.integer(treatment)) %>% 
+  select(
+    actor, block, pulled_left, treatment) %>% 
+  rename(
+    block_id = block,
+    actor_id = actor,
+    treatment_id = treatment)
+df <- d %>% 
+  transmute(
+    actor_id = as.factor(actor_id),
+    block_id = as.factor(block_id),
+    treatment_1 = as.integer(ifelse(treatment_id == 1, 1, 0)),
+    treatment_2 = as.integer(ifelse(treatment_id == 2, 1, 0)),
+    treatment_3 = as.integer(ifelse(treatment_id == 3, 1, 0)),
+    treatment_4 = as.integer(ifelse(treatment_id == 4, 1, 0)),
+    pulled_left = as.integer(pulled_left))
+df
 ```
 
-Lets bring back an old version of this model to reaquint ourselves.
+Our model will contain:
+
+1. The average log odds of each treatment (4 parameters)
+2. An effect for each actor in eaach treatment (7 x 4 = 28 parameters)
+3. An effect for each block in each treatment (6 x 4 = 24 parameters)
+
+We'll utilize partial pooling for actors and blocks to get sensible estimates
 
 $$
-pulled\_left_i \sim bernoulli(p_i)
+\begin{align}
+L_i &\sim Binomial(1, p_i)
 \\
-logit(p_i) = \alpha_i + (\beta_1 + \beta_2 condition_i)prosoc\_left_i
+logit(p_i) &= \gamma_{TID[i]} + \alpha_{ACTOR[i], TID[i]} + \beta_{BLOCK[i],TID[i]}
 \\
-\alpha_i = \alpha + \alpha_{block[i]} + \alpha_{actor[i]}
+\begin{bmatrix} \alpha_{j,1} \\\alpha_{j,2} \\\alpha_{j,3} \\\alpha_{j,4} \end{bmatrix} & \sim MVNormal(
+    \begin{bmatrix} 0 \\ 0 \\ 0 \\ 0 \end{bmatrix}
+  , S_{ACTOR})
 \\
-\alpha_{actor} \sim Normal(0, \sigma_{actor})
+\begin{bmatrix} \beta_{j,1} \\\beta_{j,2} \\\beta_{j,3} \\\beta_{j,4} \end{bmatrix} & \sim MVNormal(
+    \begin{bmatrix} 0 \\ 0 \\ 0 \\ 0 \end{bmatrix}
+  , S_{BLOCK})
 \\
-\alpha_{block} \sim Normal(0, \sigma_{block})
+S_{ACTOR} &\sim 
+  \begin{pmatrix} 
+    \sigma_{\alpha_{TRT[1]}} & 0 & 0 & 0 \\ 
+    0 & \sigma_{\alpha_{TRT[1]}} & 0 & 0 \\
+    0 & 0 & \sigma_{\alpha_{TRT[1]}} & 0 \\
+    0 & 0 & 0 & \sigma_{\alpha_{TRT[1]}} \\
+  \end{pmatrix} R_{ACTOR} \begin{pmatrix} 
+    \sigma_{\alpha_{TRT[1]}} & 0 & 0 & 0 \\ 
+    0 & \sigma_{\alpha_{TRT[1]}} & 0 & 0 \\
+    0 & 0 & \sigma_{\alpha_{TRT[1]}} & 0 \\
+    0 & 0 & 0 & \sigma_{\alpha_{TRT[1]}} \\
+  \end{pmatrix}
 \\
-\beta_1, \beta_2 \sim Normal(0, 10)
+S_{BLOCK} &\sim
+   \begin{pmatrix} 
+    \sigma_{\beta_{TRT[1]}} & 0 & 0 & 0 \\ 
+    0 & \sigma_{\beta_{TRT[1]}} & 0 & 0 \\
+    0 & 0 & \sigma_{\beta_{TRT[1]}} & 0 \\
+    0 & 0 & 0 & \sigma_{\beta_{TRT[1]}} \\
+  \end{pmatrix} R_{BLOCK} \begin{pmatrix} 
+    \sigma_{\beta_{TRT[1]}} & 0 & 0 & 0 \\ 
+    0 & \sigma_{\beta_{TRT[1]}} & 0 & 0 \\
+    0 & 0 & \sigma_{\beta_{TRT[1]}} & 0 \\
+    0 & 0 & 0 & \sigma_{\beta_{TRT[1]}} \\
+  \end{pmatrix}
 \\
-\sigma_{actor}, \sigma_{block} \sim HalfCauchy(0, 1)
+\gamma &\sim normal(0, 1)
+\\
+R_{ACTOR},\ R_{BLOCK} &\sim LKJ(4)
+\\
+\sigma_{\alpha},\ \sigma_\beta &\sim exponential(1)
+  
+\end{align}
 $$
 
-In stan:
+In the specification above actors and blocks come from two different statistical populations. Within each, the four features of each block/actor (treatment_id) are related through a covariance matrix.
+
+> This is essentially an interaction model that allows for effects of each treatment to vary by each actor and each block.
+
+Now then, lets run this in STAN.
+```{r}
+# Set up model specification
+specification <- bf(pulled_left ~ 0 + treatment_1 + treatment_2 + treatment_3 + treatment_4 + 
+                      (treatment_1 + treatment_2 + treatment_3 + treatment_4 | actor_id + block_id),
+                    family = bernoulli)
+
+fit_prior <- get_prior(specification, df)
+fit_prior[1:5,]$prior <- "normal(0, 1)"
+fit_prior[6:8,]$prior <- "lkj(4)"
+fit_prior[9:21,]$prior <- "exponential(1)"
+
+b1 <- brm(specification, data = df, family = bernoulli, 
+    prior = fit_prior, cores = 4, refresh = 0)
+summary(b1)
+```
 
 ```{r}
-b12.5 <- 
-  brm(data = d, family = bernoulli,
-      pulled_left ~ 1 + prosoc_left + condition:prosoc_left + 
-        (1 | actor) + (1 | block_id),
-      refresh = 0,
-      prior = c(prior(normal(0, 10), class = Intercept),
-                prior(normal(0, 10), class = b),
-                prior(cauchy(0, 1), class = sd)),
-      iter = 5000, warmup = 1000, chains = 3, cores = 3)
-summary(b12.5)
+spread_draws(b1, `b_.*`, regex = TRUE) %>% 
+  gather(treatment, value, b_treatment_1, b_treatment_2, b_treatment_3, b_treatment_4) %>% 
+  mutate(value = inv_logit_scaled(value)) %>% 
+  select(treatment, value) %>% 
+  group_by(treatment) %>% 
+  ggplot(aes(y = treatment, x = value)) +
+    geom_vline(xintercept = .5, linetype = 2) +
+    geom_halfeyeh(fill = alpha("steelblue", .5)) +
+    ylab("") + xlab("Posterior average treatment effect") +
+    theme(panel.grid = element_blank(),
+          text = element_text(family = "Courier"),
+          axis.ticks = element_blank())
 ```
-
-We want to understand how the treatment effect varies by block and actor. We do this by expanding each term to include a grand mean and a deviation for each individual block and each individual actor. Additionally, terms that are varying together within the same cluster have a specified covariance matrix.
-
-$$
-\begin{eqnarray}
-\text{pulled_left}_i & \sim & \text{Binomial} (n = 1, p_i) \\
-\text{logit} (p_i) & = & \alpha_i + (\beta_{1i} + \beta_{2i} \text{condition}_i) \text{prosoc_left}_i  \\
-\alpha_i & = & \alpha + \alpha_{\text{actor}_i} + \alpha_{\text{block_id}_i} \\
-\beta_{1i} & = & \beta_1 + \beta_{1, \text{actor}_i} + \beta_{1, \text{block_id}_i} \\
-\beta_{2i} & = & \beta_2 + \beta_{2, \text{actor}_i} + \beta_{2, \text{block_id}_i} \\
-\begin{bmatrix} \alpha_\text{actor} \\ \beta_{1, \text{actor}} \\ \beta_{2, \text{actor}} \end{bmatrix} & \sim & \text{MVNormal} \begin{pmatrix} \begin{bmatrix}0 \\ 0 \\ 0 \end{bmatrix} , \mathbf{S}_\text{actor} \end{pmatrix} \\
-\begin{bmatrix} \alpha_\text{block_id} \\ \beta_{1, \text{block_id}} \\ \beta_{2, \text{block_id}} \end{bmatrix} & \sim & \text{MVNormal} \begin{pmatrix} \begin{bmatrix}0 \\ 0 \\ 0 \end{bmatrix} , \mathbf{S}_\text{block_id} \end{pmatrix} \\
-\mathbf S_\text{actor} & = & \begin{pmatrix} \sigma_{\alpha_\text{actor}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{actor}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{actor}}} \end{pmatrix} 
-\mathbf R_\text{actor} \begin{pmatrix} \sigma_{\alpha_\text{actor}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{actor}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{actor}}} \end{pmatrix} \\
-\mathbf S_\text{block_id} & = & \begin{pmatrix} \sigma_{\alpha_\text{block_id}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{block_id}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{block_id}}} \end{pmatrix} 
-\mathbf R_\text{block_id} \begin{pmatrix} \sigma_{\alpha_\text{block_id}} & 0 & 0 \\ 0 & \sigma_{\beta_{1_\text{block_id}}} & 0 \\ 0 & 0 & \sigma_{\beta_{2_\text{block_id}}} \end{pmatrix} \\
-(\sigma_{\alpha_\text{actor}}, \sigma_{\beta_{1_\text{actor}}}, \sigma_{\beta_{2_\text{actor}}}) & \sim & \text{HalfCauchy} (0, 2) \\
-(\sigma_{\alpha_\text{block_id}}, \sigma_{\beta_{1_\text{block_id}}}, \sigma_{\beta_{2_\text{block_id}}}) & \sim & \text{HalfCauchy} (0, 2) \\
-\mathbf R_\text{actor} & \sim & \text{LKJcorr} (4) \\
-\mathbf R_\text{block_id} & \sim & \text{LKJcorr} (4)
-\end{eqnarray}
-$$
-
-The parameterization above is that of the centered form. In multilevel modeling, the centered form tends to have a more ergodic geometry. BRMS does this conversion on its own behind the scenes.
 
 ```{r}
-b13.6 <- 
-  brm(data = d, family = bernoulli,
-      pulled_left ~ 1 + prosoc_left + condition:prosoc_left +
-        (1 + prosoc_left + condition:prosoc_left | actor) +
-        (1 + prosoc_left + condition:prosoc_left | block_id),
-      prior = c(prior(normal(0, 1), class = Intercept),
-                prior(normal(0, 1), class = b),
-                prior(cauchy(0, 2), class = sd),
-                prior(lkj(4), class = cor)),
-      refresh = 0, control = list(adapt_delta = .95),
-      iter = 5000, warmup = 1000, chains = 3, cores = 3)
-summary(b13.6)
+spread_draws(b1, r_actor_id[actor, treatment]) %>% 
+  spread(treatment, r_actor_id) %>% 
+  ungroup() %>% 
+  transmute(
+    actor = as.factor(actor),
+    treatment_1 = inv_logit_scaled(treatment_1 + Intercept),
+    treatment_2 = inv_logit_scaled(treatment_2 + Intercept),
+    treatment_3 = inv_logit_scaled(treatment_3 + Intercept),
+    treatment_4 = inv_logit_scaled(treatment_4 + Intercept)) %>% 
+  gather(treatment, value, treatment_1, treatment_2, treatment_3, treatment_4) %>% 
+  ggplot(aes(y = treatment, x = value)) +
+    geom_halfeyeh() + ylab("") +
+    facet_wrap(~ actor, labeller = label_both) +
+    ggtitle("Most variation is across actors")
 ```
-
 
 ```{r}
-loo(b13.6, b12.5)
+spread_draws(b1, r_block_id[block, treatment]) %>% 
+  spread(treatment, r_block_id) %>% 
+  ungroup() %>% 
+  transmute(
+    block = as.factor(block),
+    treatment_1 = inv_logit_scaled(treatment_1 + Intercept),
+    treatment_2 = inv_logit_scaled(treatment_2 + Intercept),
+    treatment_3 = inv_logit_scaled(treatment_3 + Intercept),
+    treatment_4 = inv_logit_scaled(treatment_4 + Intercept)) %>% 
+   gather(treatment, value, treatment_1, treatment_2, treatment_3, treatment_4) %>% 
+   ggplot(aes(y = treatment, x = value)) +
+     geom_halfeyeh() + ylab("") +
+     facet_wrap(~ block, labeller = label_both) +
+     ggtitle("Blocks don't matter much")
 ```
 
-> Our interpretation of this experiment has not changed. These chimpanzees simply did not behave in any consistently different way in the partner treatments. The model we’ve used here does have some advantages, though. Since it allows for some individuals to differ in how they respond to the treatments, it could reveal a situation in which a treatment has no effect on average, even though some of the individuals respond strongly. That wasn’t the case here. But often we are more interested in the distribution of responses that the average response, so a model that estimates the distribution of treatment effects is very useful.
-
+> Our interpretation of this experiment has not changed. These chimpanzees simply did not behave in any consistently different way in the partner treatments. 
 
