@@ -1,0 +1,59 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+```
+
+
+Pancake 1: BB
+Pancake 2: BU
+Pancake 3: UU
+
+We serve one pancake at random. Its side is facing up. What is the probability of the other side being burnt?
+
+$$
+Pr(burnt\ down\ |\ burnt\ up) = \frac{Pr(burnt\ up,\ burnt\ down)}{Pr(burnt\ up)}
+$$
+
+```{r}
+sim_serve <- function() {
+  pancake <- sample(list(
+    c(1,1),
+    c(1,0),
+    c(0,0)), 1)[[1]]
+  
+  pancake
+}
+
+sim_side <- function() {
+  pancake <- sim_serve()
+  side <- sample(pancake, 1)[[1]]
+  side
+}
+
+gen_simulation <- function(n_samps) {
+  pancakes <- tibble(
+  samples = rerun(n_samps, sim_serve()),
+  is_bu = map_dbl(samples, ~ sum(.x) == 1),
+  is_b = map_dbl(samples, ~ sample(.x, 1)[[1]]))
+
+  (sum(pancakes$is_bu) / nrow(pancakes)) / (sum(pancakes$is_b) / nrow(pancakes))
+}
+
+
+samples <- tibble(
+  "Pr(burnt down | burnt up)" = rerun(1e3, gen_simulation(1e3)) %>% 
+    flatten_dbl())
+
+ggplot(samples, aes(`Pr(burnt down | burnt up)`)) +
+  geom_histogram(fill = "black", colour = "transparent") +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.x = element_line())
+
+```

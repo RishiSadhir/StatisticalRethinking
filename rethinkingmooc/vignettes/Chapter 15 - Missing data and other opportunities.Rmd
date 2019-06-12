@@ -1,0 +1,290 @@
+---
+title: "Chapter 15 - Missing data and other opportunities"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(dagitty)
+```
+
+Bayesian modeling comes down to "Assume, then deduce." In this chapter, we'll review two such examples: (1) Measurement error and (2) Bayesian Imputation
+
+# Measurement error
+
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+data(WaffleDivorce)
+d <- WaffleDivorce
+rm(WaffleDivorce)
+
+detach(package:rethinking, unload = T)
+suppressPackageStartupMessages(library(brms))
+```
+
+When we used the divorce rate data set earlier, we ignored the fact that measurement error was also recorded for both the divorce rate variable and the median age at marriage variable. Large states provided better samples so their measurement error is smaller. 
+
+Since large states give us better information, it makes sense for them to influence our regression more.
+
+```{r fig.width=9, fig.height=4}
+ggplot(d, aes(x = MedianAgeMarriage,
+              y = Divorce,
+              ymin = Divorce - Divorce.SE,
+              ymax = Divorce + Divorce.SE,
+              colour = Population)) +
+  geom_smooth(method = "lm", colour = "black") +
+  geom_pointrange() +
+  scale_color_viridis_c() +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "white", colour = "black")) +
+  ggtitle("Large states provide better samples", "Populous states have lower standard errors") +
+  xlab("Median age at marriage") + ylab("Divorce rate")
+```
+
+## Error on the outcome variable
+
+
+Measurement error on the outcome variable can just be thought of as a function of the true value and the error - which is determined by the population size of each state.
+```{r}
+g <- dagitty( "dag{
+A -> M
+M -> D
+A -> D
+D -> D_obs
+N -> D_obs}")
+plot(graphLayout(g))
+```
+
+
+
+Lets formalize this a bit more
+$$
+\begin{align}
+Divorce_{estimated, i} & \sim Normal(\mu_i, \sigma)
+\\
+\mu & = \alpha + \beta_1A_i + \beta_2R_i
+\\
+Divorce_{observed, i} & \sim Normal(Divorce_{estimated,i}, Divorce_{standard\_error, i})
+\\
+\text{...priors...}
+\end{align}
+$$
+
+First lets code this up with rethinking
+```{r}
+suppressPackageStartupMessages(library(rethinking))
+dlist <- list(
+  D_obs = standardize(d$Divorce),
+  D_sd = d$Divorce.SE / sd(d$Divorce),
+  M = standardize(d$Marriage),
+  A = standardize(d$MedianAgeMarriage),
+  N = nrow(d)
+)
+
+m15.1 <- ulam(
+  alist(
+    D_obs ~ dnorm(D_true, D_sd),
+    vector[N]:D_true ~ dnorm(mu, sigma),
+    mu <- a + bA*A + bM*M,
+    a ~ dnorm(0, 0.2),
+    bA ~ dnorm(0, 0.5),
+    bM ~ dnorm(0, 0.5),
+    sigma ~ dexp(1)
+  ), data = dlist, chains = 4, cores = 4)
+
+summary(m15.1)
+```
+
+```{r}
+post <- extract.samples(m15.1)
+as_tibble(post$D_true, .name_repair = "unique") %>% 
+  gather %>% 
+  group_by(key) %>% 
+  mean_hdi() %>% 
+  mutate(key = as.numeric(str_sub(key, 4))) %>% 
+  arrange(key) %>% 
+  mutate(d_obs = dlist$D_obs,
+         age = dlist$A) %>% 
+  ggplot(aes(x = age, y = value, ymin = .lower, ymax = .upper)) +
+    geom_pointrange() +
+    geom_point(aes(y = d_obs), colour = "blue", size = 2, shape = 1) +
+    geom_smooth(aes(x = age, y = value), method = lm, colour = "black", size = .7) +
+    theme(panel.background = element_rect(fill = "transparent", colour = "black"),
+          panel.grid = element_blank()) +
+    xlab("Median age at marriage (std)") +
+    ylab("Divorce rate") +
+    ggtitle("Shrinkage from outcome uncertainty", "blue circles represent observed values")
+```
+
+The graph above shows us that less certain estimate are improved by pooling information from more certain estimates.
+
+In BRMS, we can use the special function `mi` to implement the above specification.
+
+```{r}
+dlist <- list(
+  div_obs = d$Divorce,
+  div_sd = d$Divorce.SE,
+  R = d$Marriage,
+  A = d$MedianAgeMarriage)
+
+inits <- list(Yl = dlist$div_obs)
+inits_list <- list(inits, inits)
+
+b14.1_mi <- 
+  brm(data = dlist, family = gaussian,
+      div_obs | mi(div_sd) ~ 0 + intercept + R + A,
+      prior = c(prior(normal(0, 10), class = b),
+                prior(cauchy(0, 2.5), class = sigma)),
+      iter = 5000, warmup = 1000, cores = 2, chains = 2,
+      seed = 14,
+      control = list(adapt_delta = 0.99,
+                     max_treedepth = 12),
+      save_mevars = TRUE,  # note this line for the `mi()` model
+      inits = inits_list)
+
+summary(b14.1_mi)
+```
+
+
+
+
+```{r}
+data_error <-
+  fitted(b14.1_mi) %>% 
+  as_tibble() %>% 
+  bind_cols(d)
+
+data_error %>% 
+  ggplot(aes(x = Divorce.SE, y = Estimate - Divorce)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+    geom_point(colour = "steelblue", size = 3.5, alpha = .8) +
+    theme(panel.background = element_rect(fill = "transparent", colour = "black"),
+          panel.grid = element_blank())
+```
+
+## Error on both outcome and predictor
+
+In the divorce data, measurement error in the predictor `marriage rate` also comes with a standard error. Lets formalize this by using a parameter in the place of the "true" value for M, $M_{true}$. This parameter will hold the posterior distributions of the true marriage rates.
+
+$$
+\begin{align}
+D_{obs,i} &\sim Normal(D_{true,i},D_{se,i})& \text{[distribution of observed D values]}
+\\
+D_{true,i} &\sim Normal(\mu_i, \sigma)& \text{[distribution for true D values]}
+\\
+\mu_i &= \alpha + \beta_A A_i + \beta_M M_{true,i}& \text{[linear model]}
+\\
+M_{obs,i} &\sim Normal(M_{true,i},M_{se,i})& \text{[distribution for observed M values]}
+\\
+M_{true,i} &\sim Normal(0, 1)& \text{[distribution for true M values]}
+\end{align}
+\\
+\dots priors \dots
+$$
+
+```{r}
+dlist <- list(
+  D_obs = standardize(d$Divorce),
+  D_sd  = d$Divorce.SE / sd(d$Divorce),
+  M_obs = standardize(d$Marriage),
+  M_sd  = d$Marriage.SE / sd(d$Marriage),
+  A = standardize(d$MedianAgeMarriage),
+  N = nrow(d)
+)
+
+m15.2 <- ulam(
+  alist(
+    D_obs ~ dnorm(D_est , D_sd),
+    vector[N]:D_est ~ dnorm(mu , sigma),
+    mu <- a + bA*A + bM*M_est[i],
+    M_obs ~ dnorm(M_est, M_sd),
+    vector[N]:M_est ~ dnorm(0 , 1),
+    a ~ dnorm(0,0.2),
+    bA ~ dnorm(0,0.5),
+    bM ~ dnorm(0,0.5),
+    sigma ~ dexp(1)), 
+  data = dlist , chains=4 , cores=4)
+
+plot(precis(m15.2))
+```
+
+
+```{r}
+post <- extract.samples(m15.2)
+
+tibble(
+    m_est = apply(post$M_est, 2, mean),
+    d_est = apply(post$D_est, 2, mean),
+    m_obs = dlist$M_obs,
+    d_obs = dlist$D_obs) %>% 
+  ggplot() +
+    geom_point(aes(x=m_est, y = d_est), color = "blue", size = 2) +
+    geom_segment(aes(x = m_est, y = d_est, xend = m_obs, yend = d_obs), color = "blue") +
+    geom_point(aes(x=m_obs, y = d_obs), color = "red") +
+    geom_smooth(aes(x = m_est, y = d_est), colour = "blue", se = FALSE, method = lm, size = .5) +
+    xlab("Marriage rate (std)") + ylab("Divorce rate (std)") +
+    theme(panel.grid = element_blank(),
+          panel.background = element_rect(fill = "transparent", colour = "black"))
+    
+```
+
+With measurement error - any datum can be replaced by a distribution that reflects uncertainty.
+
+>> The big take home point for this section is that when you have a distribution of values, don’t reduce it down to a single value to use in a regression. Instead, use the entire distribution. Anytime we use an average value, discarding the uncertainty around that average, we risk overconfidence and spurious inference. This doesn’t only apply to measurement error, but also to cases in which data are averaged before analysis.
+
+Before we move on, lets see what BRMS has to offer. In brms, you can specify error on predictors with an `me()` statement in the form of `me(predictor, sd_predictor)` where `sd_predictor` is a vector in the data denoting the size of the measurement error, presumed to be in a standard-deviation metric.
+
+```{r}
+# the data
+dlist <- list(
+  div_obs = d$Divorce,
+  div_sd  = d$Divorce.SE,
+  mar_obs = d$Marriage,
+  mar_sd  = d$Marriage.SE,
+  A       = d$MedianAgeMarriage)
+
+# the `inits`
+inits      <- list(Yl = dlist$div_obs)
+inits_list <- list(inits, inits)
+
+b14.2_mi <- 
+  brm(data = dlist, family = gaussian,
+      div_obs | mi(div_sd) ~ 0 + intercept + me(mar_obs, mar_sd) + A,
+      prior = c(prior(normal(0, 10), class = b),
+                prior(cauchy(0, 2.5), class = sigma)),
+      iter = 5000, warmup = 1000, cores = 2, chains = 2,
+      seed = 14,
+      control = list(adapt_delta = 0.99,
+                     max_treedepth = 12),
+      save_mevars = TRUE,
+      inits = inits_list)
+
+data_error <-
+  fitted(b14.2_mi) %>%
+  as_tibble() %>%
+  bind_cols(d)
+
+posterior_samples(b14.2_mi) %>%
+  select(starts_with("Xme")) %>%
+  gather() %>%
+  # this extracts the numerals from the otherwise cumbersome names in `key` and saves them as integers
+  mutate(key = str_extract(key, "\\d+") %>% as.integer()) %>%
+  group_by(key) %>%
+  summarise(mean = mean(value)) %>%
+  bind_cols(data_error) %>%
+  ggplot(aes(x = mean, y = Estimate)) +
+  geom_segment(aes(xend = Marriage, yend = Divorce),
+               color = "red", size = 1/4) +
+  geom_point(size = 2, alpha = 2/3, color = "red") +
+  geom_point(aes(x = Marriage, y = Divorce), 
+             size = 2, alpha = 2/3, color = "blue") +
+  scale_y_continuous(breaks = seq(from = 4, to = 14, by = 2)) +
+  labs(x = "Marriage rate (posterior)" , y = "Divorce rate (posterior)") +
+  coord_cartesian(ylim = c(4, 14.5)) +
+  theme(panel.grid = element_blank(),
+        panel.background = element_rect(fill = "transparent", colour = "black"))
+  
+```
+
+
+# Missing data
